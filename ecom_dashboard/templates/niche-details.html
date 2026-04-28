@@ -1,0 +1,310 @@
+{% extends "base.html" %}
+{% block title %}Niche Management — eCommerce Dashboard{% endblock %}
+{% block page_title %}Niche & Sub-Niche Management{% endblock %}
+{% block page_subtitle %}Catalogue Structure & Organisation{% endblock %}
+
+{% block extra_style %}
+<style>
+.tree-container {
+    background: #fff;
+    border-radius: 12px;
+    box-shadow: 0 4px 15px rgba(0,0,0,0.05);
+    padding: 24px;
+    margin-bottom: 24px;
+}
+.table-card {
+    background: #fff;
+    border-radius: 12px;
+    box-shadow: 0 4px 15px rgba(0,0,0,0.05);
+    padding: 0;
+    margin-bottom: 24px;
+    overflow: hidden;
+}
+.table-header {
+    padding: 20px 24px;
+    border-bottom: 1px solid #f0f4f8;
+    background: #fbfcfd;
+}
+.table-wrap {
+    width: 100%;
+    overflow-x: auto;
+}
+table {
+    width: 100%;
+    border-collapse: collapse;
+}
+th {
+    background: #f8fafc;
+    padding: 14px 24px;
+    text-align: left;
+    font-size: 12px;
+    text-transform: uppercase;
+    color: #8a9ab0;
+    letter-spacing: 0.5px;
+    border-bottom: 1px solid #f0f4f8;
+}
+td {
+    padding: 16px 24px;
+    border-bottom: 1px solid #f0f4f8;
+    font-size: 14px;
+}
+tr:hover td {
+    background: #f9fbff;
+}
+.badge-count {
+    background: #e3f2fd;
+    color: #1976d2;
+    padding: 4px 12px;
+    border-radius: 20px;
+    font-size: 12px;
+    font-weight: 700;
+}
+.loading {
+    padding: 40px;
+    text-align: center;
+    color: #64748b;
+}
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="top-actions">
+    <button class="btn btn-outline" onclick="window.history.back()">← Back to Intelligence</button>
+    <div class="search-bar" style="margin: 0; width: 300px;">
+        <input type="text" id="nicheSearch" placeholder="Search Niches...">
+    </div>
+</div>
+
+<div class="table-card">
+    <div class="table-header">
+        <h3>Catalogue Overview</h3>
+    </div>
+    <div class="table-wrap">
+        <table id="nicheTable">
+            <thead>
+                <tr>
+                    <th style="width: 250px;">Niche Name</th>
+                    <th style="width: 300px;">Sub-Niche Name</th>
+                    <th style="text-align: center;">Total Designs</th>
+                    <th style="text-align: right;">Action</th>
+                </tr>
+            </thead>
+            <tbody id="nicheTableBody">
+                <!-- Data injected here -->
+            </tbody>
+        </table>
+    </div>
+    <div id="loadingIndicator" class="loading">Loading Niche Structure...</div>
+</div>
+
+<!-- Modal for Item Drilldown -->
+<div id="itemModal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index:1000; align-items:center; justify-content:center;">
+    <div style="background:#fff; width:80%; max-width:900px; max-height:80vh; border-radius:12px; padding:30px; position:relative; overflow-y:auto; box-shadow:0 10px 40px rgba(0,0,0,0.2);">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; border-bottom:1px solid #eee; padding-bottom:15px;">
+            <h3 id="modalTitle" style="margin:0; color:#1e2a3a;">Items in Sub-Niche</h3>
+            <button class="btn btn-sm btn-outline" onclick="document.getElementById('itemModal').style.display='none'">✕ Close</button>
+        </div>
+        <div id="modalContent"></div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let flatData = [];
+let filteredData = [];
+let currentPage = 1;
+const perPage = 100;
+let searchTimer = null;
+
+async function loadNiches() {
+    try {
+        const r = await fetch('/api/niche_management');
+        const data = await r.json();
+        if (data.error) {
+            document.getElementById('loadingIndicator').innerHTML = `<div class="error-msg">${data.error}</div>`;
+            return;
+        }
+
+        flatData = data; // Already mostly flat from API
+        filteredData = data;
+        document.getElementById('loadingIndicator').style.display = 'none';
+        renderTableRows(1);
+
+    } catch (e) {
+        document.getElementById('loadingIndicator').innerHTML = `<div class="error-msg">Failed to load data</div>`;
+    }
+}
+
+function renderTableRows(page = 1) {
+    const tbody = document.getElementById('nicheTableBody');
+    const term = (document.getElementById('nicheSearch').value || '').toLowerCase().trim();
+
+    if (!filteredData || filteredData.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="4" style="text-align:center; padding:40px; color:#888;">No results found.</td></tr>`;
+        renderPagination(0, 1);
+        return;
+    }
+
+    const total = filteredData.length;
+    const totalPages = Math.max(1, Math.ceil(total / perPage));
+    currentPage = Math.min(Math.max(1, page), totalPages);
+    const start = (currentPage - 1) * perPage;
+    const end = Math.min(start + perPage, total);
+    const pageRows = filteredData.slice(start, end);
+
+    let html = '';
+    pageRows.forEach((row) => {
+        let nName = row.Niche || "Uncategorised";
+        let subName = row.SubNiche || "No Sub-Niche";
+        
+        // Highlight logic
+        if (term) {
+            nName = applyHighlights(nName, term);
+            subName = applyHighlights(subName, term);
+        }
+
+        // Store raw values in data-* attributes (URL-encoded) to avoid quoting/escaping issues.
+        const nicheEnc = encodeURIComponent(row.Niche || "");
+        const subEnc = encodeURIComponent(row.SubNiche || "");
+
+        html += `
+            <tr>
+                <td style="font-weight:600; color:#1e2a3a;">${nName}</td>
+                <td style="color:#4a6278;">${subName}</td>
+                <td style="text-align:center;"><span class="badge-count">${fmt(row.DesignsCount)} Designs</span></td>
+                <td style="text-align:right;">
+                    <button class="btn btn-sm btn-outline view-skus-btn" data-niche="${nicheEnc}" data-subniche="${subEnc}">
+                        👁️ View SKUs
+                    </button>
+                </td>
+            </tr>
+        `;
+    });
+
+    tbody.innerHTML = html;
+    renderPagination(total, totalPages);
+}
+
+function renderPagination(totalRows, totalPages) {
+    const hostId = 'nichePagination';
+    let host = document.getElementById(hostId);
+    if (!host) {
+        host = document.createElement('div');
+        host.id = hostId;
+        host.className = 'pagination';
+        host.style.borderTop = '1px solid #f0f4f8';
+        const table = document.getElementById('nicheTable');
+        table.parentElement.appendChild(host);
+    }
+    if (totalRows <= perPage) {
+        host.innerHTML = `<span class="page-info">${fmt(totalRows)} rows</span>`;
+        return;
+    }
+    let html = '';
+    if (currentPage > 1) html += `<button class="page-btn" onclick="renderTableRows(1)">«</button>`;
+    for (let i = Math.max(1, currentPage - 2); i <= Math.min(totalPages, currentPage + 2); i++) {
+        html += `<button class="page-btn ${i === currentPage ? 'active' : ''}" onclick="renderTableRows(${i})">${i}</button>`;
+    }
+    if (currentPage < totalPages) html += `<button class="page-btn" onclick="renderTableRows(${totalPages})">»</button>`;
+    const from = ((currentPage - 1) * perPage) + 1;
+    const to = Math.min(currentPage * perPage, totalRows);
+    html += `<span class="page-info">Showing ${fmt(from)}-${fmt(to)} of ${fmt(totalRows)}</span>`;
+    host.innerHTML = html;
+}
+
+async function openItemsModal(niche, subniche) {
+    console.log("Opening Modal for:", niche, " > ", subniche);
+    const modal = document.getElementById('itemModal');
+    const title = document.getElementById('modalTitle');
+    const content = document.getElementById('modalContent');
+    
+    title.innerText = `${niche} > ${subniche}`;
+    content.innerHTML = '<div class="loading">Loading items...</div>';
+    modal.style.display = 'flex';
+    
+    try {
+        const r = await fetch(`/api/niche_items?niche=${encodeURIComponent(niche)}&sub_niche=${encodeURIComponent(subniche)}`);
+        if (!r.ok) {
+            const t = await r.text();
+            content.innerHTML = `<div class="error-msg">API error (${r.status}). ${t}</div>`;
+            return;
+        }
+        const data = await r.json();
+        
+        if (!data || !data.length) {
+            content.innerHTML = '<p>No items found.</p>';
+            return;
+        }
+        
+        let h = `
+            <table class="item-drilldown-table" style="width:100%; border-collapse:collapse; font-size:13px;">
+                <thead>
+                    <tr style="background:#f8fafc; border-bottom:1px solid #eee;">
+                        <th style="text-align:left; padding:12px; width:60px;">Image</th>
+                        <th style="text-align:left; padding:12px;">SKU / Design ID</th>
+                        <th style="text-align:left; padding:12px;">Product Name</th>
+                    </tr>
+                </thead>
+                <tbody>
+        `;
+        data.forEach(item => {
+            const img = (item.image || '').toString().trim();
+            const esc = img.replace(/&/g, '&amp;').replace(/\"/g, '&quot;').replace(/</g, '&lt;');
+            h += `
+                <tr style="border-bottom:1px solid #f8fafc;">
+                    <td style="padding:10px;">${img ? `<img class="thumb-zoom" data-fullsrc="${esc}" src="${esc}" alt="design" loading="lazy" referrerpolicy="no-referrer" style="height:34px; width:34px; object-fit:cover; border-radius:6px; border:1px solid #e0e6ef; cursor:pointer">` : '—'}</td>
+                    <td style="padding:10px; font-weight:600; color:#2196f3;">${item.sku}</td>
+                    <td style="padding:10px; color:#4a6278;">${item.title}</td>
+                </tr>
+            `;
+        });
+        h += '</tbody></table>';
+        delete content.dataset.thumbBound;
+        content.innerHTML = h;
+        if (typeof bindThumbClicks === 'function') bindThumbClicks(content);
+    } catch(e) {
+        content.innerHTML = `<div class="error-msg">Error loading items. ${e && e.message ? e.message : ''}</div>`;
+    }
+}
+
+
+function filterTree() {
+    const term = (document.getElementById('nicheSearch').value || '').toLowerCase().trim();
+    filteredData = flatData.filter(row => {
+        return (row.Niche || "").toLowerCase().includes(term) ||
+               (row.SubNiche || "").toLowerCase().includes(term);
+    });
+    renderTableRows(1);
+}
+
+// Check if there's a pre-filled NICHE from URL
+window.onload = () => {
+    loadNiches().then(() => {
+        const urlParams = new URLSearchParams(window.location.search);
+        const autoNiche = urlParams.get('niche');
+        if (autoNiche) {
+            document.getElementById('nicheSearch').value = autoNiche;
+            filterTree();
+        }
+    });
+
+    // Debounced search to avoid lag while typing
+    const searchInput = document.getElementById('nicheSearch');
+    searchInput.oninput = () => {
+        if (searchTimer) clearTimeout(searchTimer);
+        searchTimer = setTimeout(() => filterTree(), 120);
+    };
+
+    // Delegate click handler for dynamically rendered buttons
+    const tbody = document.getElementById('nicheTableBody');
+    tbody.addEventListener('click', (ev) => {
+        const btn = ev.target && ev.target.closest ? ev.target.closest('.view-skus-btn') : null;
+        if (!btn) return;
+        const niche = decodeURIComponent(btn.getAttribute('data-niche') || '');
+        const sub = decodeURIComponent(btn.getAttribute('data-subniche') || '');
+        openItemsModal(niche, sub);
+    });
+};
+</script>
+{% endblock %}

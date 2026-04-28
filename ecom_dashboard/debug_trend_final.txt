@@ -1,0 +1,14 @@
+Trend Sample (first 100):
+Empty DataFrame
+Columns: [Design ID, SEO Niche, SEO Sub Niche]
+Index: []
+
+Total Rows in Trend: 36767
+Exact match for '115881LG':
+Empty DataFrame
+Columns: [Design ID, SEO Niche]
+Index: []
+Partial match for '115881':
+Empty DataFrame
+Columns: [Design ID, SEO Niche]
+Index: []

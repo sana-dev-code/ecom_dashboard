@@ -1,0 +1,32 @@
+Order Table: shipstation_orders
+Prod Table: product_database
+
+O_SKU: Item - SKU, P_SKU: SKU To Use, P_Niche: Department
+
+Order Data Sample:
+               Item - SKU
+0     115881LG-K-T-DSY-YL
+1  101214LG-W-T-BLK-L-Yes
+2      8388LG-K-T-PRP-YXL
+3      62534LG-K-T-NVY-YM
+4      64623LG-K-T-DSY-YS
+
+Prod Data Sample:
+  SKU To Use Department
+0        New   T-Shirts
+1        New   T-Shirts
+2        New   T-Shirts
+3        New   T-Shirts
+4        New   T-Shirts
+
+Join Result:
+Empty DataFrame
+Columns: [o_sku, p_sku, niche]
+Index: []
+
+Checking a specific SKU from Order in Prod Table...
+Searching for '115881LG-K-T-DSY-YL' in Prod.
+Match result:
+Empty DataFrame
+Columns: [SKU To Use]
+Index: []

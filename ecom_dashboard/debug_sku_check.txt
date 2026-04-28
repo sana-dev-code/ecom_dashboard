@@ -1,0 +1,44 @@
+Column 'Company-Custom-Label' Sample:
+  Company-Custom-Label
+0     ABB-BDH-C1-D1-E2
+1     ABB-BDH-C1-D1-E3
+2     ABB-BDH-C1-D1-E4
+3     ABB-BDH-C1-D2-E5
+4     ABB-BDH-C1-D2-E6
+5     ABB-BDH-C1-D3-E7
+6     ABB-BEz-C1-D1-E2
+7     ABB-BEz-C1-D1-E3
+8     ABB-BEz-C1-D1-E4
+9     ABB-BEz-C1-D2-E5
+
+Column 'Alternative-Company-Custom-Label' Sample:
+  Alternative-Company-Custom-Label
+0                       M-T-MGRN-S
+1                       M-T-MGRN-M
+2                       M-T-MGRN-L
+3                      M-T-MGRN-XL
+4                     M-T-MGRN-2XL
+5                     M-T-MGRN-3XL
+6                        M-T-SPG-S
+7                        M-T-SPG-M
+8                        M-T-SPG-L
+9                       M-T-SPG-XL
+
+Column 'Linking-SKU' Sample:
+    Linking-SKU
+0     Inventory
+1    M-T-MNBL-S
+2    M-T-MNBL-M
+3    M-T-MNBL-L
+4   M-T-MNBL-XL
+5  M-T-MNBL-2XL
+6  M-T-MNBL-3XL
+7   M-T-NEOMT-S
+8   M-T-NEOMT-M
+9   M-T-NEOMT-L
+
+Column 'SKU To Use' Sample:
+Empty DataFrame
+Columns: [SKU To Use]
+Index: []
+

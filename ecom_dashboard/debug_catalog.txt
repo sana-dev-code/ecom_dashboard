@@ -1,0 +1,19 @@
+Table: catalogue_02_database
+
+Cols: ['Input Date', 'Assigned Date', 'Listed By', 'Date Listed', 'Validation TL', 'Validation M', 'Status', 'Source', 'Sub-Source', 'Design Tool', 'Graphic Designer', 'Derivation Type', 'Parent Design ID', 'Favourites', 'Link', 'Notes', 'eBay', 'eBay Brand', 'eBay Main Category', 'eBay Secondry Category', 'eBay Department', 'eBay Store Category', 'Amazon', 'Amazon Brand', 'Amazon Browse Node', 'Amazon Department', 'Amazon Store Category', 'Etsy', 'Etsy Category', 'Etsy Store Category', 'Website', 'Website Category', 'Violation', 'Violation Sub-Category', 'Design Type', 'Product Category', 'Product Sub-Category', 'Parent Image Colour', 'Mockup Identifier', 'Product Code', 'Price (S-2XL)', 'Price (3XL-5XL)', 'Design ID - Black (For Light Garments)', 'Design ID - White (For Dark Garments)', 'Design ID - Colourful (For Light & Dark Garments)', 'Supplier', 'Effort', 'Event', 'Design Description', 'ID No', 'Full Response', 'Niche', 'Sub Niche', 'eBay Title', 'Counts', 'eBay Description', 'eBay Theme', 'Amazon Title', 'Counts_1', 'Amazon Description', 'Amazon Search Terms', 'Platinum Keywords-1', 'Platinum Keywords-2', 'Platinum Keywords-3', 'Platinum Keywords-4', 'Platinum Keywords-5', 'Bullet Points-1', 'Bullet Points-2', 'Bullet Points-3', 'Bullet Points-4', 'Bullet Points-5', 'Occassions-1', 'Amazon Theme', 'ETSY Title', 'Counts_2', 'ETSY Description', 'ETSY Tags', 'Tags Check', 'Website Title', 'Counts_3', 'Website Main Description', 'Website Short Description', 'Website Tags', 'Re-check Trademark Violation', 'Re-check Trademark Violation Explaination', 'Amazon Restricted Words', 'Amazon Restricted Words Explaination', 'Design Subject', 'Design Element', 'Design Style', 'Copyright', 'Copyright Explanation', 'Trademark', 'Trademark Explanation', 'Publicity Rights', 'Publicity Rights Explanation', 'Inspired By', 'Inspired By Explanation', 'Can I Sell This Design?', 'Reason', 'UK', 'Justia', 'Violation Word', 'Violation Team ( Can I Sell this design on T-Shirt )', 'Violation Checked By', 'eBay Allowed', 'Amazon Allowed', 'Approved By', 'Approval Remarks', 'Ebay Final  Formula', 'Amazon Final Formula', 'Design ID - Black (For Light Garments)_1', 'Design ID - White (For Dark Garments)_1', 'Design ID - Colourful (For Light & Dark Garments)_1', 'Design Description_1', 'Column_115', 'Column_116', 'Column_117', 'Column_118', 'Column_119', 'Column_120', 'Column_121', 'Column_122', 'Column_123']
+
+Potential Niche Cols: ['eBay Department', 'Amazon Department', 'Niche', 'Sub Niche']
+Potential SKU Cols: ['Product Code']
+
+Catalog Data Sample:
+               Product Code eBay Department
+0                                      None
+1                                      None
+2                                      None
+3         61082-61430-61036            None
+4         61082-61430-61036            None
+5         61082-61430-61036            None
+6  61023-61019-61033-64000B            None
+7                     C8001            None
+8                     C8001            None
+9                     C8001            None

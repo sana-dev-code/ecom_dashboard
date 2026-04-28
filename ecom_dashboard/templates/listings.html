@@ -1,0 +1,153 @@
+{% extends "base.html" %}
+{% block title %}Active Listings{% endblock %}
+{% block page_title %}Active Listings{% endblock %}
+{% block page_subtitle %}active_listings.duckdb{% endblock %}
+{% block content %}
+<div class="stat-grid">
+  <div class="stat-card accent"><div class="label">Total Listings</div><div class="value" id="totalListings">...</div></div>
+  <div class="stat-card green"><div class="label">Marketplaces</div><div class="value" id="totalMarkets">...</div></div>
+</div>
+<div class="chart-grid" id="chartArea" style="display:none">
+  <div class="chart-card">
+    <h3>By Marketplace / Site</h3>
+    <div class="chart-wrap"><canvas id="marketChart"></canvas></div>
+  </div>
+</div>
+  <div class="filter-box">
+    <div class="filter-group">
+      <label>🔍 SEARCH</label>
+      <input type="text" id="searchInput" placeholder="SKU, title, keyword…" onkeydown="if(event.key==='Enter')loadListings(1)">
+    </div>
+    <div class="filter-group">
+      <label>✏️ SOURCE — type to filter</label>
+      <input type="text" id="filterSource" list="listingsSourceDatalist"
+        placeholder="Type here: Creative Fabrica, Freepik, … (suggestions as you type)"
+        onkeydown="if(event.key==='Enter')loadListings(1)" autocomplete="off"
+        style="width:100%; padding:10px; border-radius:8px; border:1px solid #cfd8dc; font-size:14px; box-sizing:border-box;">
+      <datalist id="listingsSourceDatalist"></datalist>
+    </div>
+    <div class="filter-group">
+      <label>🏪 MARKET / CHANNEL</label>
+      <input type="text" id="filterMarket" placeholder="e.g. Amazon" onkeydown="if(event.key==='Enter')loadListings(1)">
+    </div>
+    <div style="display:flex; gap:10px">
+      <button class="btn" style="flex:1" onclick="loadListings(1)">Filter</button>
+      <button id="exportBtn" class="btn btn-success" style="flex:1" onclick="exportCSV()">💾 Export</button>
+    </div>
+  </div>
+
+  <div class="table-card">
+    <div class="table-header"><h3>Active Listings</h3></div>
+    <div id="listingsTable"><div class="loading">Loading...</div></div>
+    <div class="pagination" id="pagination"></div>
+  </div>
+{% endblock %}
+
+{% block scripts %}
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script>
+let currentPage=1,totalRows=0,perPage=50;
+let summarySeq = 0;
+let tableSeq = 0;
+
+function getFilterParams() {
+  return `search=${encodeURIComponent(document.getElementById('searchInput').value)}` +
+         `&source=${encodeURIComponent((document.getElementById('filterSource')||{}).value||'')}` +
+         `&market=${encodeURIComponent(document.getElementById('filterMarket').value)}`;
+}
+
+function getHighlightTerms() {
+  return [
+    document.getElementById('searchInput').value,
+    (document.getElementById('filterSource')||{}).value,
+    document.getElementById('filterMarket').value
+  ].filter(Boolean).join(' ');
+}
+
+async function loadSummary(){
+  const rid = ++summarySeq;
+  const r=await fetch('/api/listings/summary');
+  const d=await r.json();
+  if (rid !== summarySeq) return;
+  if(d.error){return;}
+  document.getElementById('totalListings').textContent=fmt(d.total_listings||0);
+  if(d.by_marketplace && d.by_marketplace.length){
+    document.getElementById('totalMarkets').textContent=d.by_marketplace.length;
+    if (!window.Chart) { document.getElementById('chartArea').style.display='none'; return; }
+    document.getElementById('chartArea').style.display='grid';
+    const k=Object.keys(d.by_marketplace[0]);
+    new Chart(document.getElementById('marketChart'),{
+      type:'doughnut',
+      data:{
+        labels:d.by_marketplace.map(x=>`${x[k[0]]} (${fmt(x[k[1]])})`),
+        datasets:[{data:d.by_marketplace.map(x=>x[k[1]]),backgroundColor:['#2196f3','#1D9E75','#f5a623','#9c27b0','#e53935','#00bcd4']}]
+      },
+      options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'bottom',labels:{font:{size:12}}}}}
+    });
+  }
+}
+async function loadListingSources() {
+  try {
+    const r = await fetch('/api/listings/listing_sources');
+    const d = await r.json();
+    const dl = document.getElementById('listingsSourceDatalist');
+    if (!dl) return;
+    dl.innerHTML = '';
+    (d.sources || []).forEach(s => {
+      const o = document.createElement('option');
+      o.value = s;
+      dl.appendChild(o);
+    });
+  } catch (e) { console.warn(e); }
+}
+
+async function loadListings(page){
+  const rid = ++tableSeq;
+  currentPage=page;
+  document.getElementById('listingsTable').innerHTML='<div class="loading">Loading...</div>';
+  const s = document.getElementById('searchInput').value;
+  const src = (document.getElementById('filterSource')||{}).value||'';
+  const m = document.getElementById('filterMarket').value;
+  const url = `/api/listings?page=${page}&per_page=50&search=${encodeURIComponent(s)}&source=${encodeURIComponent(src)}&market=${encodeURIComponent(m)}`;
+  const r = await fetch(url);
+  const d = await r.json();
+  if (rid !== tableSeq) return;
+  if (d.error) { showError('listingsTable', d.error); return; }
+  totalRows = d.total || 0;
+  renderTable('listingsTable', d.data, d.columns, getHighlightTerms());
+  let html='';
+  const total=Math.ceil(totalRows/perPage);
+  for(let i=Math.max(1,currentPage-2);i<=Math.min(total,currentPage+2);i++)
+    html+=`<button class="page-btn ${i===currentPage?'active':''}" onclick="loadListings(${i})">${i}</button>`;
+  html+=`<span class="page-info">${fmt(totalRows)} listings</span>`;
+  document.getElementById('pagination').innerHTML=html;
+}
+async function exportCSV(){
+  const url = `/api/listings/export?${getFilterParams()}`;
+  const filename = 'Listings_Export.csv';
+  if (window.pywebview && window.pywebview.api) {
+    const btn = document.getElementById('exportBtn');
+    const oldText = btn ? btn.textContent : '';
+    if (btn) { btn.disabled = true; btn.textContent = 'Exporting...'; }
+    try {
+      const ok = await window.pywebview.api.download_csv(filename, 'http://127.0.0.1:5000' + url);
+      if (!ok) alert('Export failed. Please try again.');
+    } catch (e) {
+      console.warn(e);
+      alert('Export failed. Please try again.');
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = oldText || '💾 Export'; }
+    }
+  } else {
+    const link = document.createElement('a');
+    link.href = url;
+    link.setAttribute('download', filename);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }
+}
+
+loadListingSources(); loadSummary(); loadListings(1);
+</script>
+{% endblock %}

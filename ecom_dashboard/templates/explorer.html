@@ -1,0 +1,102 @@
+{% extends "base.html" %}
+{% block title %}DB Explorer{% endblock %}
+{% block page_title %}Database Explorer{% endblock %}
+{% block page_subtitle %}Browse any table from any .duckdb file{% endblock %}
+
+{% block content %}
+<div style="display:flex;gap:16px;margin-bottom:20px;flex-wrap:wrap">
+  <div>
+    <label style="font-size:12px;font-weight:600;color:#6a8aaa;display:block;margin-bottom:6px">SELECT DATABASE</label>
+    <select id="dbSelect" onchange="loadTables()" style="padding:9px 14px;border:1px solid #dde3ed;border-radius:8px;font-size:13.5px;background:#fff;min-width:220px">
+      {% for db in db_files %}
+      <option value="{{ db }}">{{ db.replace('_',' ').title() }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div>
+    <label style="font-size:12px;font-weight:600;color:#6a8aaa;display:block;margin-bottom:6px">SELECT TABLE</label>
+    <select id="tableSelect" onchange="loadTableData(1)" style="padding:9px 14px;border:1px solid #dde3ed;border-radius:8px;font-size:13.5px;background:#fff;min-width:220px">
+      <option>— Select a table —</option>
+    </select>
+  </div>
+  <div style="align-self:flex-end">
+    <span id="rowCount" style="font-size:13px;color:#8a9ab0"></span>
+  </div>
+</div>
+
+<!-- Column info -->
+<div id="columnInfo" style="margin-bottom:16px"></div>
+
+<div class="table-card">
+  <div class="table-header">
+    <h3 id="tableTitle">Select a database and table</h3>
+    <div style="font-size:12px;color:#8a9ab0" id="tableInfo"></div>
+  </div>
+  <div id="explorerTable"><div class="loading">Choose a database and table above to explore</div></div>
+  <div class="pagination" id="pagination"></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let currentPage=1,totalRows=0,perPage=50;
+
+async function loadTables(){
+  const db=document.getElementById('dbSelect').value;
+  const r=await fetch(`/api/explorer/tables?db=${db}`);
+  const d=await r.json();
+  const sel=document.getElementById('tableSelect');
+  sel.innerHTML='<option>— Select a table —</option>';
+  if(d.tables&&d.tables.length){
+    d.tables.forEach(t=>{
+      sel.innerHTML+=`<option value="${t.name}">${t.name} (${fmt(t.row_count)} rows)</option>`;
+    });
+    // Auto select first
+    sel.selectedIndex=1;
+    loadTableData(1);
+  }
+}
+
+async function loadTableData(page){
+  currentPage=page;
+  const db=document.getElementById('dbSelect').value;
+  const table=document.getElementById('tableSelect').value;
+  if(!table||table.startsWith('—')) return;
+
+  document.getElementById('explorerTable').innerHTML='<div class="loading">Loading data...</div>';
+  document.getElementById('tableTitle').textContent=`${db} → ${table}`;
+
+  const r=await fetch(`/api/explorer/query?db=${db}&table=${encodeURIComponent(table)}&page=${page}&per_page=${perPage}`);
+  const d=await r.json();
+
+  if(d.error){document.getElementById('explorerTable').innerHTML=`<div class="error-msg">${d.error}</div>`;return;}
+
+  totalRows=d.total||0;
+  document.getElementById('tableInfo').textContent=`${fmt(totalRows)} total rows · ${(d.columns||[]).length} columns`;
+  document.getElementById('rowCount').textContent=`${fmt(totalRows)} rows`;
+
+  // Show column chips
+  if(d.columns){
+    document.getElementById('columnInfo').innerHTML=
+      '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:4px">'
+      +d.columns.map(c=>`<span style="background:#e3f0ff;color:#1565c0;border-radius:12px;padding:2px 10px;font-size:11px;font-weight:600">${c}</span>`).join('')
+      +'</div>';
+  }
+
+  renderTable('explorerTable',d.data,d.columns);
+
+  // Pagination
+  const total=Math.ceil(totalRows/perPage);
+  let html='';
+  if(currentPage>1) html+=`<button class="page-btn" onclick="loadTableData(1)">«</button>`;
+  for(let i=Math.max(1,currentPage-2);i<=Math.min(total,currentPage+2);i++)
+    html+=`<button class="page-btn ${i===currentPage?'active':''}" onclick="loadTableData(${i})">${i}</button>`;
+  if(currentPage<total) html+=`<button class="page-btn" onclick="loadTableData(${total})">»</button>`;
+  html+=`<span class="page-info">Page ${currentPage} of ${fmt(total)} · ${fmt(totalRows)} rows</span>`;
+  document.getElementById('pagination').innerHTML=html;
+}
+
+// Load on start
+loadTables();
+</script>
+{% endblock %}

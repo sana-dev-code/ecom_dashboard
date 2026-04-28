@@ -1,0 +1,9 @@
+Trend Raw Sample:
+  Product ID  ... column179
+0        232  ...      None
+1        872  ...      None
+2       1348  ...      None
+3       6268  ...      None
+4       5404  ...      None
+
+[5 rows x 180 columns]

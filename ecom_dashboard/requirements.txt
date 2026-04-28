@@ -1,0 +1,11 @@
+flask
+duckdb
+pandas
+requests
+pywebview
+pyinstaller
+fastapi
+uvicorn
+google-generativeai
+openai
+anthropic

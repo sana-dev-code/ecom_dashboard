@@ -1,0 +1,182 @@
+{% extends "base.html" %}
+{% block title %}Products{% endblock %}
+{% block page_title %}Products{% endblock %}
+{% block page_subtitle %}product_database.duckdb{% endblock %}
+
+{% block content %}
+
+<div class="stat-grid" id="productStats">
+  <div class="stat-card accent"><div class="label">Total Products</div><div class="value" id="totalProducts">...</div></div>
+  <div class="stat-card"><div class="label">Columns</div><div class="value" id="totalCols">...</div></div>
+  <div class="stat-card green"><div class="label">Top Brand</div><div class="value" id="topBrand" style="font-size:16px">...</div></div>
+  <div class="stat-card orange"><div class="label">Top Color</div><div class="value" id="topColor" style="font-size:16px">...</div></div>
+</div>
+
+<div class="chart-grid" id="chartArea" style="display:none">
+  <div class="chart-card">
+    <h3>By Brand / Supplier</h3>
+    <div class="chart-wrap"><canvas id="brandChart"></canvas></div>
+  </div>
+  <div class="chart-card">
+    <h3>By Gender / Department</h3>
+    <div class="chart-wrap"><canvas id="genderChart"></canvas></div>
+  </div>
+</div>
+
+  <div class="filter-box">
+    <div class="filter-group">
+      <label>🔍 SEARCH</label>
+      <input type="text" id="searchInput" placeholder="Search products..." onkeydown="if(event.key==='Enter')loadProducts(1)">
+    </div>
+    <div class="filter-group">
+      <label>🏭 BRAND / SUPPLIER</label>
+      <input type="text" id="filterSource" placeholder="e.g. Nike" onkeydown="if(event.key==='Enter')loadProducts(1)">
+    </div>
+    <div class="filter-group">
+      <label>📂 CATEGORY</label>
+      <input type="text" id="filterMarket" placeholder="e.g. Shoes" onkeydown="if(event.key==='Enter')loadProducts(1)">
+    </div>
+    <div style="display:flex; gap:10px">
+      <button class="btn" style="flex:1" onclick="loadProducts(1)">Filter</button>
+      <button id="exportBtn" class="btn btn-success" style="flex:1" onclick="exportCSV()">💾 Export</button>
+    </div>
+  </div>
+
+  <div class="table-card">
+    <div class="table-header"><h3>Product List</h3></div>
+    <div id="productsTable"><div class="loading">Loading products...</div></div>
+    <div class="pagination" id="pagination"></div>
+  </div>
+{% endblock %}
+
+{% block scripts %}
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script>
+let currentPage=1, totalRows=0, perPage=50;
+let summarySeq = 0;
+let tableSeq = 0;
+
+function getFilterParams() {
+  return `search=${encodeURIComponent(document.getElementById('searchInput').value)}` +
+         `&source=${encodeURIComponent(document.getElementById('filterSource').value)}` +
+         `&market=${encodeURIComponent(document.getElementById('filterMarket').value)}`;
+}
+
+function getHighlightTerms() {
+  return [
+    document.getElementById('searchInput').value,
+    document.getElementById('filterSource').value,
+    document.getElementById('filterMarket').value
+  ].filter(Boolean).join(' ');
+}
+
+function exportCSV() {
+  window.location.href = `/api/products/export?${getFilterParams()}`;
+}
+
+async function loadSummary(){
+  const rid = ++summarySeq;
+  const r = await fetch('/api/products/summary');
+  const d = await r.json();
+  if (rid !== summarySeq) return;
+  if(d.error){document.getElementById('productStats').innerHTML=`<div class="error-msg">${d.error}</div>`;return;}
+  document.getElementById('totalProducts').textContent=fmt(d.total_products||0);
+  document.getElementById('totalCols').textContent=(d.columns||[]).length;
+  if(d.top_brands&&d.top_brands.length) document.getElementById('topBrand').textContent=Object.values(d.top_brands[0])[0]||'—';
+  if(d.top_colors&&d.top_colors.length) document.getElementById('topColor').textContent=Object.values(d.top_colors[0])[0]||'—';
+
+  if(d.top_brands&&d.top_brands.length){
+    if (!window.Chart) { document.getElementById('chartArea').style.display='none'; return; }
+    document.getElementById('chartArea').style.display='grid';
+    const bKeys=Object.keys(d.top_brands[0]);
+    new Chart(document.getElementById('brandChart'),{
+      type:'bar',
+      data:{labels:d.top_brands.map(x=>x[bKeys[0]]),datasets:[{label:'Products',data:d.top_brands.map(x=>x[bKeys[1]]),backgroundColor:'#2196f3aa',borderRadius:5}]},
+      options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{display:false},ticks:{font:{size:10}}},y:{ticks:{font:{size:10}}}}}
+    });
+  }
+  if(d.by_gender && d.by_gender.length){
+    const gKeys=Object.keys(d.by_gender[0]);
+    new Chart(document.getElementById('genderChart'),{
+      type:'pie',
+      data:{
+        labels:d.by_gender.map(x=>`${x[gKeys[0]]} (${fmt(x[gKeys[1]])})`),
+        datasets:[{data:d.by_gender.map(x=>x[gKeys[1]]),backgroundColor:['#2196f3','#1D9E75','#f5a623','#9c27b0','#e53935']}]
+      },
+      options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'bottom',labels:{font:{size:12}}}}}
+    });
+  } else if(d.by_dept && d.by_dept.length){
+    const dKeys=Object.keys(d.by_dept[0]);
+    new Chart(document.getElementById('genderChart'),{
+      type:'pie',
+      data:{
+        labels:d.by_dept.map(x=>`${x[dKeys[0]]} (${fmt(x[dKeys[1]])})`),
+        datasets:[{data:d.by_dept.map(x=>x[dKeys[1]]),backgroundColor:['#2196f3','#1D9E75','#f5a623','#9c27b0','#e53935','#ff9800','#795548']}]
+      },
+      options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'bottom',labels:{font:{size:11}}}}}
+    });
+  }
+}
+
+async function loadProducts(page){
+  const rid = ++tableSeq;
+  currentPage=page;
+  document.getElementById('productsTable').innerHTML='<div class="loading">Loading...</div>';
+  const s = document.getElementById('searchInput').value;
+  const b = document.getElementById('filterSource').value;
+  const c = document.getElementById('filterMarket').value;
+  const url = `/api/products?page=${page}&per_page=${perPage}&search=${encodeURIComponent(s)}&source=${encodeURIComponent(b)}&market=${encodeURIComponent(c)}`;
+  const r = await fetch(url);
+  const d = await r.json();
+  if (rid !== tableSeq) return;
+  if(d.error){document.getElementById('productsTable').innerHTML=`<div class="error-msg">${d.error}</div>`;return;}
+  totalRows=d.total||0;
+  renderTable('productsTable',d.data,d.columns, getHighlightTerms());
+  renderPagination();
+}
+
+function renderPagination(){
+  const total=Math.ceil(totalRows/perPage);
+  let html=``;
+  for(let i=Math.max(1,currentPage-2);i<=Math.min(total,currentPage+2);i++){
+    html+=`<button class="page-btn ${i===currentPage?'active':''}" onclick="loadProducts(${i})">${i}</button>`;
+  }
+  html+=`<span class="page-info">Showing ${((currentPage-1)*perPage)+1}–${Math.min(currentPage*perPage,totalRows)} of ${fmt(totalRows)}</span>`;
+  document.getElementById('pagination').innerHTML=html;
+}
+
+function exportCSV(){
+  const s = document.getElementById('searchInput').value;
+  const b = document.getElementById('filterSource').value;
+  const c = document.getElementById('filterMarket').value;
+  const url = `/api/products/export?search=${encodeURIComponent(s)}&source=${encodeURIComponent(b)}&market=${encodeURIComponent(c)}`;
+  const filename = 'Products_Export.csv';
+  if (window.pywebview && window.pywebview.api) {
+    (async () => {
+      const btn = document.getElementById('exportBtn');
+      const oldText = btn ? btn.textContent : '';
+      if (btn) { btn.disabled = true; btn.textContent = 'Exporting...'; }
+      try {
+        const ok = await window.pywebview.api.download_csv(filename, 'http://127.0.0.1:5000' + url);
+        if (!ok) alert('Export failed. Please try again.');
+      } catch (e) {
+        console.warn(e);
+        alert('Export failed. Please try again.');
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = oldText || '💾 Export'; }
+      }
+    })();
+  } else {
+    const link = document.createElement('a');
+    link.href = url;
+    link.setAttribute('download', filename);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }
+}
+
+loadSummary();
+loadProducts(1);
+</script>
+{% endblock %}

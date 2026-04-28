@@ -1,0 +1,72 @@
+Amount - Order Shipping
+Amount - Order Tax
+Amount - Order Total
+Amount - Paid by Customer
+Amount - Shipping Cost
+Bill To - Name
+Carrier - Carrier Selected
+Carrier - Service Requested
+Carrier - Service Selected
+Custom - Field 1
+Custom - Field 2
+Custom - Field 3
+Customer Email
+Customs - Package Contents
+Date - Hold Until
+Date - Order Date
+Date - Paid Date
+Date - Ship By Date
+Date - Shipped Date
+Gift - Flag
+Gift - Message
+Insurance - Cost
+Insurance - Insured Value
+Insurance - Provider
+Item - Category
+Item - Cost
+Item - Cost Extended
+Item - Fill SKU
+Item - ISBN
+Item - Image URL
+Item - Location
+Item - Name
+Item - Options
+Item - Origin Country Code
+Item - Price
+Item - Qty
+Item - SKU
+Item - UPC
+Item - Weight
+Item - Weight (oz)
+Market - Markeplace Name
+Market - Market Order URL
+Market - Store Name
+Notes - From Buyer
+Notes - Internal
+Notes - To Buyer
+Order - Number
+Order - Pay Method
+Order - Status
+Order - Weight
+Service - Confirmation Type
+Service - Package Type
+Ship To - Address 1
+Ship To - Address 2
+Ship To - Address 3
+Ship To - City
+Ship To - Company
+Ship To - Country
+Ship To - Name
+Ship To - Phone
+Ship To - Postal Code
+Ship To - Residential Flag
+Ship To - State
+Ship To - Verified Flag
+Ship To - Zone
+Source
+rn
+promoted_fees
+promoted_fees_pct
+order_earnings
+gross_amount
+item_id

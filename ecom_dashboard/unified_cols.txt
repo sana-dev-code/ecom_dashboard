@@ -1,0 +1,38 @@
+Amount - Order Shipping
+Amount - Order Tax
+Amount - Paid by Customer
+Date - Order Date
+IMAGE1
+Item - Image URL
+Item - Price
+Item - Qty
+Item number
+Listing site
+Market - Markeplace Name
+Market - Store Name
+Title
+asin1
+channel
+list_date
+listing_price
+listing_status
+sku
+source_type
+Design ID
+Source
+Design Type
+Design Subject
+Design Element
+Design Style
+Event
+Niche
+Sub Niche
+Mockup Identifier
+Derivation Type
+Can I Sell This Design?
+Colour_Name
+Size
+Gender_Apparel
+Picture_Name
+normalized_channel
+Listed

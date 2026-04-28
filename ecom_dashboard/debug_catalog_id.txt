@@ -1,0 +1,31 @@
+Sample ID No:
+     ID No  ...                            Sub Niche
+0   ID-121  ...     75th Birthday / Retro Auto Humor
+1   ID-121  ...        74th Birthday / Vintage Parts
+2   ID-121  ...                        73rd Birthday
+3   ID-121  ...     72nd Birthday / Automotive Humor
+4   ID-121  ...    Vintage Humor, Classic Birth Year
+5   ID-121  ...        70th Birthday Retro Born Year
+6   ID-121  ...            1957 Born / 69th Birthday
+7   ID-121  ...  Vintage Birth Year / Mechanic Humor
+8   ID-121  ...               Vintage Mechanic Humor
+9   ID-121  ...     66th Birthday (1960) Retro Humor
+10  ID-121  ...                 65th Birthday (1961)
+11  ID-121  ...                        64th Birthday
+12  ID-121  ...                63rd Birthday Vintage
+13  ID-121  ...  Vintage Automotive / Novelty Slogan
+14  ID-121  ...     Vintage Birth Year / Retro Humor
+15  ID-121  ...                   60th Birthday 1966
+16  ID-121  ...                        59th Birthday
+17  ID-121  ...                        58th Birthday
+18  ID-121  ...           1969 Year of Birth / Retro
+19  ID-121  ...                   1970 56th Birthday
+
+[20 rows x 3 columns]
+
+Search result for 115881:
+Empty DataFrame
+Columns: [Input Date, Assigned Date, Listed By, Date Listed, Validation TL, Validation M, Status, Source, Sub-Source, Design Tool, Graphic Designer, Derivation Type, Parent Design ID, Favourites, Link, Notes, eBay, eBay Brand, eBay Main Category, eBay Secondry Category, eBay Department, eBay Store Category, Amazon, Amazon Brand, Amazon Browse Node, Amazon Department, Amazon Store Category, Etsy, Etsy Category, Etsy Store Category, Website, Website Category, Violation, Violation Sub-Category, Design Type, Product Category, Product Sub-Category, Parent Image Colour, Mockup Identifier, Product Code, Price (S-2XL), Price (3XL-5XL), Design ID - Black (For Light Garments), Design ID - White (For Dark Garments), Design ID - Colourful (For Light & Dark Garments), Supplier, Effort, Event, Design Description, ID No, Full Response, Niche, Sub Niche, eBay Title, Counts, eBay Description, eBay Theme, Amazon Title, Counts_1, Amazon Description, Amazon Search Terms, Platinum Keywords-1, Platinum Keywords-2, Platinum Keywords-3, Platinum Keywords-4, Platinum Keywords-5, Bullet Points-1, Bullet Points-2, Bullet Points-3, Bullet Points-4, Bullet Points-5, Occassions-1, Amazon Theme, ETSY Title, Counts_2, ETSY Description, ETSY Tags, Tags Check, Website Title, Counts_3, Website Main Description, Website Short Description, Website Tags, Re-check Trademark Violation, Re-check Trademark Violation Explaination, Amazon Restricted Words, Amazon Restricted Words Explaination, Design Subject, Design Element, Design Style, Copyright, Copyright Explanation, Trademark, Trademark Explanation, Publicity Rights, Publicity Rights Explanation, Inspired By, Inspired By Explanation, Can I Sell This Design?, Reason, ...]
+Index: []
+
+[0 rows x 124 columns]

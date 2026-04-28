@@ -1,0 +1,42 @@
+{
+  "Dashboard": {
+    "status": "EXCEPTION",
+    "msg": "Expecting value: line 1 column 1 (char 0)"
+  },
+  "Orders (Date)": {
+    "status": "OK",
+    "count": 50
+  },
+  "Orders (Source)": {
+    "status": "OK",
+    "count": 0
+  },
+  "Orders (Qty)": {
+    "status": "OK",
+    "count": 50
+  },
+  "Orders (Market)": {
+    "status": "OK",
+    "count": 50
+  },
+  "Products (Brand)": {
+    "status": "OK",
+    "count": 0
+  },
+  "Products (Category)": {
+    "status": "OK",
+    "count": 0
+  },
+  "Listings (Market)": {
+    "status": "OK",
+    "count": 0
+  },
+  "Trends Summary": {
+    "status": "OK",
+    "count": 100
+  },
+  "Trends Search": {
+    "status": "OK",
+    "count": 50
+  }
+}

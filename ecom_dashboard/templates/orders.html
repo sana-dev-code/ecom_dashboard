@@ -1,0 +1,809 @@
+{% extends "base.html" %}
+{% block title %}Orders — eCommerce Dashboard{% endblock %}
+{% block page_title %}ShipStation Orders{% endblock %}
+{% block page_subtitle %}shipstation_orders.duckdb{% endblock %}
+
+{% block content %}
+<div class="stat-grid">
+  <div class="stat-card accent">
+    <div class="label">Total Orders</div>
+    <div class="value" id="totalOrders">...</div>
+  </div>
+  <div class="stat-card green clickable" onclick="selectTopSku()" title="Click to analyze top SKU">
+    <div class="label">Top SKU (Analyze)</div>
+    <div class="value" id="topSku" style="font-size:14px">...</div>
+  </div>
+  <div class="stat-card orange">
+    <div class="label">Top Niche</div>
+    <div class="value" id="topNiche" style="font-size:14px">...</div>
+  </div>
+</div>
+
+<style>
+  .clickable {
+    cursor: pointer;
+    transition: transform 0.2s;
+  }
+
+  .clickable:hover {
+    transform: translateY(-3px);
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.1);
+  }
+
+  .stat-mini {
+    background: #f8f9fa;
+    padding: 12px;
+    border-radius: 8px;
+    border: 1px solid #eee;
+  }
+
+  .stat-mini .label {
+    font-size: 10px;
+    color: #666;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .stat-mini .value {
+    font-size: 14px;
+    font-weight: 600;
+    color: #333;
+    margin-top: 4px;
+  }
+
+  .stat-mini.accent {
+    background: #e3f2fd;
+    border-color: #2196f3;
+  }
+
+  .stat-mini.accent .value {
+    color: #2196f3;
+  }
+
+  /* Filter highlighting: only active filters get colored */
+  .filter-active {
+    border-color: #22c55e !important;
+    box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.18) !important;
+    background: rgba(34, 197, 94, 0.06) !important;
+  }
+</style>
+
+<div class="chart-grid" id="chartArea" style="display:none">
+  <div class="chart-card">
+    <h3>Orders Over Time</h3>
+    <div class="chart-wrap" style="height:240px"><canvas id="timelineChart"></canvas></div>
+  </div>
+  <div class="chart-card">
+    <h3>Top Niches by Revenue (£)</h3>
+    <div class="chart-wrap"><canvas id="nicheChart"></canvas></div>
+  </div>
+</div>
+
+<div style="display:flex; gap:8px; margin: 0 0 12px 0;">
+  <button id="ordersViewBtn" class="btn btn-sm btn-outline" onclick="setOrdersPageMode('orders')">Orders View</button>
+  <button id="joinedViewBtn" class="btn btn-sm btn-outline" onclick="setOrdersPageMode('joined')">Active Listings vs Orders</button>
+</div>
+
+<div class="filter-box">
+  <div class="filter-group">
+    <label>🔍 SEARCH SKU / NAME</label>
+    <input type="text" id="searchInput" placeholder="Search orders..." onkeydown="if(event.key==='Enter')loadAll()">
+  </div>
+  <div class="filter-group">
+    <label>📅 START DATE</label>
+    <input type="date" id="startDate" onchange="loadAll()">
+  </div>
+  <div class="filter-group">
+    <label>📅 END DATE</label>
+    <input type="date" id="endDate" onchange="loadAll()">
+  </div>
+  <div class="filter-group">
+    <label>⚡ PRESETS</label>
+    <select id="datePreset" onchange="applyPreset()">
+      <option value="">Custom</option>
+      <option value="7">Last 7 Days</option>
+      <option value="21">Last 21 Days</option>
+      <option value="30">Last 30 Days</option>
+      <option value="60">Last 60 Days</option>
+      <option value="all">All Time</option>
+    </select>
+  </div>
+  <div class="filter-group" id="sourceFilterGroup" style="margin-bottom:0;">
+    <label id="labelFilterSource">🏷️ SOURCE</label>
+    <select id="filterSource" onchange="onSourceQuickPick(this)" style="width:100%; padding:8px; border-radius:6px; border:1px solid #ddd;">
+      <option value="">All Sources</option>
+    </select>
+  </div>
+  <div class="filter-group" id="joinedListingMarketGroup" style="display:none;">
+    <label>🛒 LISTING CHANNEL</label>
+    <select id="filterJoinedListing" onchange="loadAll()">
+      <option value="">All channels</option>
+      <option value="ebay">eBay</option>
+      <option value="amazon">Amazon</option>
+      <option value="etsy">Etsy</option>
+      <option value="excel">Excel import</option>
+    </select>
+  </div>
+  <div class="filter-group">
+    <label id="labelFilterMarket">🌍 MARKET</label>
+    <select id="filterMarket" onchange="loadAll()">
+      <option value="">All Markets</option>
+      <option value="UK">UK</option>
+      <option value="US">US / Other</option>
+    </select>
+  </div>
+  <div class="filter-group">
+    <label id="labelFilterQty">📦 MIN QTY</label>
+    <input type="number" id="filterQty" placeholder="Min Qty" onkeydown="if(event.key==='Enter')loadAll()">
+  </div>
+  <div class="filter-group" id="joinedSoldFilterGroup" style="display:none;">
+    <label>📉 SOLD FILTER (≥) — type 6 for “6+”</label>
+    <input type="number" id="joinedSoldFilter" min="0" step="1" placeholder="1" onchange="loadAll()"
+      onkeydown="if(event.key==='Enter')loadAll()">
+  </div>
+  <div class="filter-group">
+    <label>🧠 VIEW MODE</label>
+    <select id="analysisView" onchange="loadAll()">
+      <option value="1" selected>Analysis View (Recommended)</option>
+      <option value="0">Raw View (All Columns)</option>
+    </select>
+  </div>
+  <div style="display:flex; gap:10px">
+    <button id="filterBtn" class="btn" style="flex:1" onclick="loadAll()">Filter</button>
+    <button id="exportBtn" class="btn btn-success" style="flex:1" onclick="exportCSV()" title="Export filtered results to CSV">💾
+      Export</button>
+  </div>
+  <div id="filterStatus" style="margin-top:8px; font-size:12px; color:#8a9ab0; display:none;"></div>
+</div>
+
+<div class="intelligence-card" id="skuIntel"
+  style="display:none; margin-bottom:20px; padding:20px; background:#fff; border-radius:12px; box-shadow:0 4px 15px rgba(0,0,0,0.05); border-left:4px solid #2196f3">
+  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px">
+    <h3 style="margin:0">🔍 Intelligence: <span id="intelSkuName" style="color:#2196f3">...</span></h3>
+    <button class="btn btn-sm btn-outline" onclick="document.getElementById('skuIntel').style.display='none'">✕
+      Close</button>
+  </div>
+  <div class="stat-grid" style="grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap:15px">
+    <div class="stat-mini">
+      <div class="label">Brand</div>
+      <div class="value" id="intelBrand">...</div>
+    </div>
+    <div class="stat-mini">
+      <div class="label">Material</div>
+      <div class="value" id="intelMaterial">...</div>
+    </div>
+    <div class="stat-mini">
+      <div class="label">Unit Cost</div>
+      <div class="value" id="intelCost">...</div>
+    </div>
+    <div class="stat-mini clickable" onclick="openNicheDetails('niche')" title="View in Niche Management">
+      <div class="label">Niche</div>
+      <div class="value" id="intelNiche" style="color: #2196f3">...</div>
+    </div>
+    <div class="stat-mini clickable" onclick="openNicheDetails('sub')" title="View in Niche Management">
+      <div class="label">Sub-Niche</div>
+      <div class="value" id="intelSub" style="color: #2196f3">...</div>
+    </div>
+    <div class="stat-mini accent">
+      <div class="label">Listings (AMZ/eBay)</div>
+      <div class="value" id="intelListings">...</div>
+    </div>
+    <div class="stat-mini" id="trendContainer" style="grid-column: span 2; background: #fffcf0; border-color: #ffe082">
+      <div class="label">Sales Trend (7d | 21d | 30d | 60d)</div>
+      <div class="value" style="color: #f57c00" id="intelTrends">...</div>
+    </div>
+    <div class="stat-mini">
+      <div class="label">eBay Status</div>
+      <div class="value" id="intelStatus">...</div>
+    </div>
+  </div>
+</div>
+
+<div class="table-card">
+  <div class="table-header">
+    <h3>Order Records</h3>
+  </div>
+  <div id="ordersTable">
+    <div class="loading">Loading orders...</div>
+  </div>
+  <div class="pagination" id="pagination"></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script>
+  let currentPage = 1, totalRows = 0, perPage = 50;
+  let timelineChart = null;
+  let nicheChart = null;
+  let ordersPageMode = 'orders';
+  // Prevent race conditions (older responses overwriting newer filters)
+  let summarySeq = 0;
+  let tableSeq = 0;
+  let ordersAbort = null;
+  let summaryAbort = null;
+  let joinedAbort = null;
+
+  function setFilteringUI(isFiltering, msg = '') {
+    const btn = document.getElementById('filterBtn');
+    const status = document.getElementById('filterStatus');
+    if (btn) {
+      btn.disabled = !!isFiltering;
+      btn.textContent = isFiltering ? 'Filtering…' : 'Filter';
+    }
+    if (status) {
+      status.style.display = isFiltering ? 'block' : (msg ? 'block' : 'none');
+      status.textContent = msg || (isFiltering ? 'Applying filters…' : '');
+    }
+  }
+  const ordersLabels = {
+    source: '🏪 SOURCE (ShipStation)',
+    market: '🌍 MARKET',
+    qty: '📦 MIN QTY'
+  };
+
+  function getSourceFilterValue() {
+    return (document.getElementById('filterSource') || {}).value || '';
+  }
+
+  function onSourceQuickPick(sel) {
+    loadAll();
+  }
+
+  async function loadSourcesForMode() {
+    try {
+      const url = ordersPageMode === 'joined'
+        ? '/api/listings/listing_sources'
+        : '/api/orders/sources';
+      const r = await fetch(url);
+      const d = await r.json();
+      const sel = document.getElementById('filterSource');
+      const cur = sel.value;
+      sel.innerHTML = '<option value="">All Sources</option>';
+      (d.sources || []).forEach(s => {
+        const o = document.createElement('option');
+        o.value = s;
+        o.textContent = s;
+        sel.appendChild(o);
+      });
+      if ([...sel.options].some(o => o.value === cur)) sel.value = cur;
+      const lab = document.getElementById('labelFilterSource');
+      if (lab) {
+        lab.textContent = ordersPageMode === 'joined'
+          ? '🏷️ SOURCE — quick pick (product origin)'
+          : '🏷️ SOURCE — quick pick (ShipStation)';
+      }
+    } catch (e) {
+      console.warn('loadSourcesForMode', e);
+    }
+  }
+
+  function applyPreset() {
+    const p = document.getElementById('datePreset').value;
+    if (!p) return;
+    const end = new Date();
+    const start = new Date();
+
+    if (p === 'all') {
+      document.getElementById('startDate').value = '';
+      document.getElementById('endDate').value = '';
+    } else {
+      start.setDate(end.getDate() - parseInt(p));
+      document.getElementById('startDate').value = start.toISOString().split('T')[0];
+      document.getElementById('endDate').value = end.toISOString().split('T')[0];
+    }
+    loadAll();
+  }
+
+  function getFilterParams() {
+    return `search=${encodeURIComponent(document.getElementById('searchInput').value)}` +
+      `&start_date=${document.getElementById('startDate').value}` +
+      `&end_date=${document.getElementById('endDate').value}` +
+      `&source=${encodeURIComponent(getSourceFilterValue())}` +
+      `&market=${encodeURIComponent(document.getElementById('filterMarket').value)}` +
+      `&qty=${document.getElementById('filterQty').value}` +
+      `&analysis_view=${document.getElementById('analysisView').value}`;
+  }
+
+  function getHighlightTerms() {
+    const terms = [
+      document.getElementById('searchInput').value,
+      document.getElementById('filterQty').value,
+      document.getElementById('startDate').value,
+      document.getElementById('endDate').value,
+      getSourceFilterValue(),
+      document.getElementById('filterMarket').value
+    ].filter(Boolean);
+    return terms.join(' ');
+  }
+
+  function getActiveFilterColumnKeywords() {
+    const isJoined = ordersPageMode === 'joined';
+    const out = [];
+
+    const hasStart = !!String((document.getElementById('startDate') || {}).value || '').trim();
+    const hasEnd = !!String((document.getElementById('endDate') || {}).value || '').trim();
+    if (hasStart || hasEnd) out.push('date', 'day', 'created', 'ordered');
+
+    const src = getSourceFilterValue();
+    if (String(src || '').trim()) out.push('source', 'origin');
+
+    if (isJoined) {
+      const listingCh = (document.getElementById('filterJoinedListing') || {}).value || '';
+      if (String(listingCh || '').trim()) out.push('channel', 'market', 'platform', 'listing');
+
+      const soldRaw = (document.getElementById('joinedSoldFilter') || {}).value || '';
+      if (String(soldRaw || '').trim()) out.push('sold', 'qty sold', 'sold_qty', 'total sold');
+
+      const qtyRaw = (document.getElementById('filterQty') || {}).value || '';
+      if (String(qtyRaw || '').trim()) out.push('sold', 'qty sold', 'sold_qty', 'total sold');
+    } else {
+      const market = (document.getElementById('filterMarket') || {}).value || '';
+      if (String(market || '').trim()) out.push('market', 'country');
+
+      const qtyRaw = (document.getElementById('filterQty') || {}).value || '';
+      if (String(qtyRaw || '').trim()) out.push('qty', 'quantity', 'items');
+    }
+
+    return Array.from(new Set(out));
+  }
+
+  function extractSku(str) {
+    const match = str.match(/\((.*?)\)/);
+    let s = match ? match[1] : str.split(' | ')[0].trim();
+    return s.replace(/\.+$/, '').trim(); // Remove trailing dot(s)
+  }
+
+  async function selectTopSku() {
+    const topText = document.getElementById('topSku').textContent;
+    if (topText && topText !== '...' && topText !== '—') {
+      const sku = extractSku(topText);
+      loadSkuIntelligence(sku);
+    }
+  }
+
+  async function loadSkuIntelligence(sku) {
+    console.log("Loading intelligence for SKU:", sku);
+    const container = document.getElementById('skuIntel');
+    container.style.display = 'block';
+    container.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+    // Update table filter automatically to show orders for this SKU
+    document.getElementById('searchInput').value = sku;
+    loadOrders(1);
+
+    const r = await fetch(`/api/sku_intelligence?sku=${encodeURIComponent(sku)}`);
+    const d = await r.json();
+
+    if (d.error) {
+      document.getElementById('intelSkuName').textContent = "Error";
+      return;
+    }
+
+    const p = d.product || {};
+    const m = d.mapping || {};
+    const l = d.listings || { amazon: 0, ebay: 0, ebay_status: 'Inactive' };
+
+    document.getElementById('intelSkuName').textContent = (p.name && p.name !== 'N/A') ? p.name : d.sku;
+    document.getElementById('intelBrand').textContent = p.brand || 'N/A';
+    document.getElementById('intelMaterial').textContent = p.material || 'N/A';
+    document.getElementById('intelCost').textContent = p.cost || 'N/A';
+    document.getElementById('intelNiche').textContent = m.niche || 'N/A';
+    document.getElementById('intelSub').textContent = m.sub_niche || 'N/A';
+    document.getElementById('intelListings').textContent = `${l.amazon} AMZ / ${l.ebay} eBay`;
+    document.getElementById('intelStatus').innerHTML = l.ebay_status === 'Active' ? '<span style="color:green">● Active</span>' : '<span style="color:red">○ Inactive</span>';
+    
+    const t = d.trends || {};
+    document.getElementById('intelTrends').textContent = `${t['7d']||0} | ${t['21d']||0} | ${t['30d']||0} | ${t['60d']||0} orders`;
+  }
+
+  function openNicheDetails(type) {
+      let val = '';
+      if (type === 'niche') val = document.getElementById('intelNiche').textContent;
+      if (type === 'sub') val = document.getElementById('intelSub').textContent;
+      if (val && val !== 'N/A' && val !== '...') {
+          window.location.href = `/niche-details?niche=${encodeURIComponent(val)}`;
+      } else {
+          window.location.href = `/niche-details`;
+      }
+  }
+
+  async function loadSummary() {
+    const rid = ++summarySeq;
+    try { if (summaryAbort) summaryAbort.abort(); } catch (_) {}
+    summaryAbort = new AbortController();
+    const r = await fetch(`/api/orders/summary?${getFilterParams()}`, { signal: summaryAbort.signal });
+    const d = await r.json();
+    if (rid !== summarySeq) return;
+    console.log("Dashboard Summary Data:", d);
+
+    if (d.error) { document.querySelector('.stat-grid').innerHTML = `<div class="error-msg">${d.error}</div>`; return; }
+
+    document.getElementById('totalOrders').textContent = fmt(d.total_orders || 0);
+
+    // Update Top SKU Box
+    if (d.top_skus && d.top_skus.length > 0) {
+      const top = d.top_skus[0];
+      document.getElementById('topSku').textContent = top.DisplayLabel || '—';
+      document.getElementById('topSku').title = top.DisplayLabel || '';
+    } else {
+      document.getElementById('topSku').textContent = '—';
+    }
+
+    // Update Top Niche Box
+    if(d.top_niches && d.top_niches.length > 0){
+      const tn = d.top_niches[0];
+      document.getElementById('topNiche').textContent = `${tn.label} (£${tn.revenue.toFixed(0)})`;
+    } else {
+      document.getElementById('topNiche').textContent = '—';
+    }
+
+    // If Chart.js is not available (offline), skip charts but keep the page usable.
+    if (!window.Chart) {
+      document.getElementById('chartArea').style.display = 'none';
+      return;
+    }
+
+    document.getElementById('chartArea').style.display = 'grid';
+
+    // Destroy old charts to prevent duplicate renders
+    if (timelineChart) timelineChart.destroy();
+    if (nicheChart) nicheChart.destroy();
+
+    // 1. Timeline Chart
+    if (d.timeline && d.timeline.length) {
+      timelineChart = new Chart(document.getElementById('timelineChart'), {
+        type: 'line',
+        data: {
+          labels: d.timeline.map(x => x.day),
+          datasets: [{ label: 'Orders', data: d.timeline.map(x => x.orders), borderColor: '#2196f3', backgroundColor: 'rgba(33,150,243,.08)', fill: true, tension: .35, pointRadius: 3, borderWidth: 2 }]
+        },
+        options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { grid: { display: false }, ticks: { font: { size: 10 }, maxRotation: 45 } }, y: { ticks: { font: { size: 10 } } } } }
+      });
+    }
+
+    // 2. Top Niche Chart
+    if (d.top_niches && d.top_niches.length > 0) {
+      nicheChart = new Chart(document.getElementById('nicheChart'), {
+        type: 'bar',
+        data: {
+          labels: d.top_niches.map(x => x.label.slice(0, 30)),
+          datasets: [{
+            label: 'Revenue (£)',
+            data: d.top_niches.map(x => x.revenue),
+            backgroundColor: '#1a73e8cc',
+            borderRadius: 5
+          }]
+        },
+        options: {
+          indexAxis: 'y',
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => ` £${ctx.raw.toLocaleString()}` } } },
+          scales: { x: { ticks: { font: { size: 10 } } }, y: { ticks: { font: { size: 10 } } } }
+        }
+      });
+    }
+  }
+
+  async function loadOrders(page) {
+    const rid = ++tableSeq;
+    currentPage = page;
+    document.getElementById('ordersTable').innerHTML = '<div class="loading">Loading...</div>';
+    const searchVal = getHighlightTerms();
+    try { if (ordersAbort) ordersAbort.abort(); } catch (_) {}
+    ordersAbort = new AbortController();
+    let r;
+    try {
+      r = await fetch(`/api/orders?page=${page}&per_page=${perPage}&${getFilterParams()}`, { signal: ordersAbort.signal });
+    } catch (e) {
+      if (rid !== tableSeq) return;
+      if (e && e.name === 'AbortError') return;
+      document.getElementById('ordersTable').innerHTML = `<div class="error-msg">Network error while loading orders. ${e && e.message ? e.message : ''}</div>`;
+      return;
+    }
+    let d;
+    try {
+      d = await r.json();
+    } catch (e) {
+      if (rid !== tableSeq) return;
+      const txt = await r.text().catch(() => '');
+      document.getElementById('ordersTable').innerHTML = `<div class="error-msg">Unexpected response while loading orders (HTTP ${r.status}). ${txt ? 'Server returned non-JSON.' : ''}</div>`;
+      return;
+    }
+    if (rid !== tableSeq) return;
+    if (d.error) { document.getElementById('ordersTable').innerHTML = `<div class="error-msg">${d.error}</div>`; return; }
+    totalRows = d.total || 0;
+    renderTable('ordersTable', d.data, d.columns, searchVal, document.getElementById('searchInput').value, getActiveFilterColumnKeywords());
+    renderPagination();
+  }
+
+  function getJoinedSoldParams() {
+    const raw = (document.getElementById('joinedSoldFilter').value || '').trim();
+    if (raw === '') return { min_sold: '', max_sold: '' };
+    const n = Number(raw);
+    if (!Number.isFinite(n) || isNaN(n)) return { min_sold: '', max_sold: '' };
+    const i = Math.max(0, Math.floor(n));
+    return { min_sold: String(i), max_sold: '' }; // "6" means 6+ (>=6)
+  }
+
+  function ensureJoinedDateRange() {
+    // Intentionally no-op: allow Joined view to run with empty dates
+    // when the user only wants to filter by Sold.
+  }
+
+  function setActive(el, on) {
+    if (!el) return;
+    el.classList.toggle('filter-active', !!on);
+  }
+
+  function updateFilterHighlights() {
+    const isJoined = ordersPageMode === 'joined';
+
+    const searchEl = document.getElementById('searchInput');
+    const startEl = document.getElementById('startDate');
+    const endEl = document.getElementById('endDate');
+    const presetEl = document.getElementById('datePreset');
+    const sourceEl = document.getElementById('filterSource');
+    const joinedListingEl = document.getElementById('filterJoinedListing');
+    const marketEl = document.getElementById('filterMarket');
+    const qtyEl = document.getElementById('filterQty');
+    const joinedSoldEl = document.getElementById('joinedSoldFilter');
+
+    const hasSearch = !!((searchEl && searchEl.value) || '').trim();
+    const hasStart = !!((startEl && startEl.value) || '').trim();
+    const hasEnd = !!((endEl && endEl.value) || '').trim();
+    const hasSource = !!((sourceEl && sourceEl.value) || '').trim();
+    const hasJoinedListing = !!((joinedListingEl && joinedListingEl.value) || '').trim();
+    const hasMarket = !!((marketEl && marketEl.value) || '').trim();
+    const hasQty = !!((qtyEl && qtyEl.value) || '').trim();
+
+    setActive(searchEl, hasSearch);
+    setActive(startEl, hasStart);
+    setActive(endEl, hasEnd);
+    setActive(sourceEl, hasSource);
+    setActive(qtyEl, hasQty);
+
+    // Preset is only meaningful when user chose a preset (not Custom).
+    setActive(presetEl, !!((presetEl && presetEl.value) || '').trim());
+
+    // Joined-only highlights
+    setActive(joinedListingEl, isJoined && hasJoinedListing);
+    setActive(joinedSoldEl, isJoined && joinedSoldEl && !!String(joinedSoldEl.value || '').trim());
+
+    // Orders-only highlights
+    setActive(marketEl, !isJoined && hasMarket);
+  }
+
+  async function loadListingsWithSalesFromOrders(page) {
+    const rid = ++tableSeq;
+    currentPage = page;
+    document.getElementById('ordersTable').innerHTML = '<div class="loading">Loading...</div>';
+
+    const search = document.getElementById('searchInput').value;
+    const shipSource = getSourceFilterValue();
+    const listingChannel = document.getElementById('filterJoinedListing').value;
+    updateFilterHighlights();
+    const startDate = document.getElementById('startDate').value;
+    const endDate = document.getElementById('endDate').value;
+    const sold = getJoinedSoldParams();
+    const minSoldFromQty = document.getElementById('filterQty').value;
+
+    const params = new URLSearchParams({
+      page: String(page),
+      per_page: String(perPage),
+      search: search,
+      market: listingChannel,
+      start_date: startDate,
+      end_date: endDate
+    });
+    if (shipSource) params.set('source', shipSource);
+    // Precedence (Joined):
+    // 1) MIN SOLD (Total =) exact match when provided
+    // 2) SOLD FILTER (≥) when exact is blank
+    const qtyNum = (minSoldFromQty !== '' && !isNaN(Number(minSoldFromQty))) ? Number(minSoldFromQty) : null;
+    if (qtyNum != null) {
+      const q = Math.max(0, Math.floor(qtyNum));
+      // Exact sold match: "="
+      params.set('min_sold', String(q));
+      params.set('max_sold', String(q));
+    } else if (sold.min_sold) {
+      params.set('min_sold', sold.min_sold);
+      params.delete('max_sold');
+    }
+    if (sold.max_sold) params.set('max_sold', sold.max_sold);
+
+    // Always include Source in keyword search (UI toggle removed)
+    params.set('search_in_source', '1');
+
+    try { if (joinedAbort) joinedAbort.abort(); } catch (_) {}
+    joinedAbort = new AbortController();
+    // Joined queries can be heavy; ensure we never spin forever with no UI feedback.
+    const timeoutMs = 120000; // 2 min
+    const timeoutId = setTimeout(() => {
+      try { joinedAbort.abort(); } catch (_) {}
+    }, timeoutMs);
+
+    let r;
+    try {
+      r = await fetch(`/api/listings_with_sales?${params.toString()}`, { signal: joinedAbort.signal });
+    } catch (e) {
+      clearTimeout(timeoutId);
+      if (rid !== tableSeq) return;
+      if (e && e.name === 'AbortError') {
+        document.getElementById('ordersTable').innerHTML =
+          `<div class="error-msg">Joined query timed out after ${Math.round(timeoutMs / 1000)}s. Try setting a date range and keep “1+ sold”.</div>`;
+        return;
+      }
+      document.getElementById('ordersTable').innerHTML =
+        `<div class="error-msg">Network error while running joined filter. ${e && e.message ? e.message : ''}</div>`;
+      return;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+
+    let d;
+    try {
+      d = await r.json();
+    } catch (e) {
+      if (rid !== tableSeq) return;
+      const txt = await r.text().catch(() => '');
+      document.getElementById('ordersTable').innerHTML =
+        `<div class="error-msg">Unexpected response while running joined filter (HTTP ${r.status}). ${txt ? 'Server returned non-JSON.' : ''}</div>`;
+      return;
+    }
+    if (rid !== tableSeq) return;
+    if (d.error) { document.getElementById('ordersTable').innerHTML = `<div class="error-msg">${d.error}</div>`; return; }
+
+    totalRows = d.total || 0;
+    renderTable('ordersTable', d.data, d.columns, getHighlightTerms(), document.getElementById('searchInput').value, getActiveFilterColumnKeywords());
+    renderPagination();
+  }
+
+  function setOrdersPageMode(mode) {
+    ordersPageMode = mode;
+    const isJoined = mode === 'joined';
+    document.getElementById('joinedSoldFilterGroup').style.display = isJoined ? 'flex' : 'none';
+    document.getElementById('joinedListingMarketGroup').style.display = isJoined ? 'flex' : 'none';
+    document.getElementById('analysisView').disabled = isJoined;
+    document.getElementById('filterMarket').disabled = isJoined;
+    document.getElementById('chartArea').style.display = isJoined ? 'none' : 'grid';
+    document.getElementById('ordersViewBtn').classList.toggle('btn-success', !isJoined);
+    document.getElementById('joinedViewBtn').classList.toggle('btn-success', isJoined);
+    document.querySelector('.table-header h3').textContent = isJoined ? 'Active Listings vs Orders (Joined)' : 'Order Records';
+
+    const labelM = document.getElementById('labelFilterMarket');
+    if (labelM) labelM.textContent = isJoined ? '🌍 MARKET (N/A in joined)' : '🌍 MARKET';
+    const labelQ = document.getElementById('labelFilterQty');
+    if (labelQ) labelQ.textContent = isJoined ? '📦 MIN SOLD (Total =)' : '📦 MIN QTY';
+
+    // UX: make it obvious which columns the filters affect in Joined mode
+    const searchInput = document.getElementById('searchInput');
+    if (searchInput) {
+      searchInput.placeholder = isJoined ? 'Search SKU / Title / Source…' : 'Search orders...';
+    }
+    const qtyInput = document.getElementById('filterQty');
+    if (qtyInput) {
+      qtyInput.placeholder = isJoined ? 'Exact Sold' : 'Min Qty';
+    }
+
+    // Do not auto-default Sold Filter. User may want exact sold only (Total =),
+    // or may intentionally leave Sold Filter empty.
+    updateFilterHighlights();
+    loadSourcesForMode().then(() => loadAll());
+  }
+
+  function loadAll() {
+    const t0 = performance.now();
+    setFilteringUI(true, 'Applying filters…');
+    updateFilterHighlights();
+    if (ordersPageMode === 'joined') {
+      loadListingsWithSalesFromOrders(1)
+        .catch((e) => {
+          if (e && e.name === 'AbortError') return;
+          console.warn('joined load error', e);
+        })
+        .finally(() => {
+          const ms = Math.round(performance.now() - t0);
+          setFilteringUI(false, `Done in ${ms}ms`);
+        });
+      return;
+    }
+    Promise.allSettled([loadSummary(), loadOrders(1)])
+      .finally(() => {
+        const ms = Math.round(performance.now() - t0);
+        setFilteringUI(false, `Done in ${ms}ms`);
+      });
+  }
+
+  async function exportCSV() {
+    const btn = document.getElementById('exportBtn');
+    const oldText = btn ? btn.textContent : '';
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = 'Exporting...';
+    }
+    const isJoined = ordersPageMode === 'joined';
+    let url = '';
+    let filename = '';
+    if (isJoined) {
+      // Export exactly what the Joined table shows
+      const shipSource = getSourceFilterValue();
+      const listingChannel = document.getElementById('filterJoinedListing').value;
+      const startDate = document.getElementById('startDate').value;
+      const endDate = document.getElementById('endDate').value;
+      const sold = getJoinedSoldParams();
+      const minSoldFromQty = document.getElementById('filterQty').value;
+      const search = document.getElementById('searchInput').value;
+
+      const params = new URLSearchParams({
+        search: search,
+        market: listingChannel,
+        start_date: startDate,
+        end_date: endDate,
+        search_in_source: '1'
+      });
+      if (shipSource) params.set('source', shipSource);
+      const qtyNum = (minSoldFromQty !== '' && !isNaN(Number(minSoldFromQty))) ? Number(minSoldFromQty) : null;
+      if (qtyNum != null) {
+        const q = Math.max(0, Math.floor(qtyNum));
+        params.set('min_sold', String(q));
+        params.set('max_sold', String(q));
+      } else if (sold.min_sold) {
+        params.set('min_sold', sold.min_sold);
+        params.delete('max_sold');
+      }
+      if (sold.max_sold) params.set('max_sold', sold.max_sold);
+
+      url = `/api/listings_with_sales/export?${params.toString()}`;
+      filename = 'Active_Listings_vs_Orders_Export.csv';
+    } else {
+      url = `/api/orders/export?${getFilterParams()}`;
+      filename = 'ShipStation_Orders_Export.csv';
+    }
+    if (window.pywebview && window.pywebview.api) {
+      try {
+        const ok = await window.pywebview.api.download_csv(filename, 'http://127.0.0.1:5000' + url);
+        if (!ok) alert('Export failed. If you have heavy filters, try narrowing the date range or sold filter and export again.');
+      } catch (e) {
+        console.warn('download_csv error', e);
+        alert('Export failed. Please try again.');
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = oldText || '💾 Export';
+        }
+      }
+    } else {
+      const link = document.createElement('a');
+      link.href = url;
+      link.setAttribute('download', filename);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = oldText || '💾 Export';
+      }
+    }
+  }
+
+  function goToPage(i) {
+    if (ordersPageMode === 'joined') loadListingsWithSalesFromOrders(i);
+    else loadOrders(i);
+  }
+
+  function renderPagination() {
+    const total = Math.ceil(totalRows / perPage);
+    if (total <= 1) { document.getElementById('pagination').innerHTML = ''; return; }
+    let html = '';
+    for (let i = Math.max(1, currentPage - 2); i <= Math.min(total, currentPage + 2); i++)
+      html += `<button class="page-btn ${i === currentPage ? 'active' : ''}" onclick="goToPage(${i})">${i}</button>`;
+    const rowLabel = ordersPageMode === 'joined' ? 'rows' : 'orders';
+    html += `<span class="page-info">${fmt(totalRows)} total ${rowLabel}</span>`;
+    document.getElementById('pagination').innerHTML = html;
+  }
+
+  setOrdersPageMode('orders');
+</script>
+{% endblock %}
