@@ -14,13 +14,17 @@ import json
 import io
 import csv
 import sys
+import socket
 import threading
+import tempfile
+import uuid
+import mimetypes
 from typing import List, Dict, Any, Optional
 
 import pandas as pd
 import duckdb
 import requests
-from flask import Flask, render_template, jsonify, request, Response
+from flask import Flask, render_template, jsonify, request, Response, stream_with_context
 from data_loader import DataLoader
 
 try:
@@ -29,21 +33,608 @@ except ImportError:
     webview = None
 
 # Base directory for relative paths (Portability Fix)
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Priority:
+# 1) ECOM_DASHBOARD_ROOT (set by portable launcher) -> allows Files/ next to the .bat (zip root)
+# 2) Frozen build (PyInstaller): folder containing the .exe, OR its parent if that contains Files/
+# 3) Dev: folder containing this .py file
+_root_override = os.environ.get("ECOM_DASHBOARD_ROOT", "").strip()
+if _root_override:
+    BASE_DIR = os.path.abspath(_root_override)
+elif getattr(sys, "frozen", False):
+    _exe_dir = os.path.dirname(sys.executable)
+    _parent = os.path.dirname(_exe_dir)
+    if os.path.isdir(os.path.join(_parent, "Files")) and not os.path.isdir(os.path.join(_exe_dir, "Files")):
+        BASE_DIR = _parent
+    else:
+        BASE_DIR = _exe_dir
+else:
+    # Dev/source mode: prefer the nearest parent that contains Files/
+    # This makes the project portable when copied to another machine,
+    # regardless of whether python is started from repo root or package dir.
+    _here = os.path.dirname(os.path.abspath(__file__))
+    _parent = os.path.dirname(_here)
+    if os.path.isdir(os.path.join(_here, "Files")):
+        BASE_DIR = _here
+    elif os.path.isdir(os.path.join(_parent, "Files")):
+        BASE_DIR = _parent
+    else:
+        BASE_DIR = _here
 
 # Path helper for PyInstaller
 def get_resource_path(relative_path):
     meipass = getattr(sys, '_MEIPASS', None)
     if meipass:
         return os.path.join(meipass, relative_path)
-    return os.path.join(os.path.abspath("."), relative_path)
+    return os.path.join(BASE_DIR, relative_path)
 
 app = Flask(__name__, 
             template_folder=get_resource_path("templates"),
             static_folder=get_resource_path("static"))
 
+# ─── CLIENT-SIDE ERROR LOG (UI → backend) ─────────────────────────────────────
+# Keeps lightweight recent logs for debugging page-load failures (e.g. Niche Mgmt).
+_client_log_lock = threading.Lock()
+_client_logs: List[Dict[str, Any]] = []
+
+
+@app.route("/api/client_log", methods=["POST"])
+def api_client_log():
+    try:
+        payload = request.get_json(silent=True) or {}
+        rec = {
+            "ts": payload.get("ts"),
+            "page": payload.get("page", ""),
+            "tag": payload.get("tag", ""),
+            "message": payload.get("message", ""),
+            "extra": payload.get("extra", None),
+            "ip": request.remote_addr,
+        }
+        with _client_log_lock:
+            _client_logs.append(rec)
+            if len(_client_logs) > 200:
+                del _client_logs[:-200]
+        # Also print to stderr so it shows in dev terminals.
+        try:
+            print(f"[CLIENT_LOG] {rec.get('page')} {rec.get('tag')}: {rec.get('message')}", file=sys.stderr)
+        except Exception:
+            pass
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/client_log", methods=["GET"])
+def api_client_log_list():
+    with _client_log_lock:
+        return jsonify({"logs": list(_client_logs)})
+
 # Initialize Data Loader
 loader = DataLoader(BASE_DIR)
+
+# ─── BACKGROUND EXPORT (prepare → status → download) ──────────────────────────
+_saved_exports_lock = threading.Lock()
+_saved_exports: Dict[str, Dict[str, Any]] = {}
+
+def _export_get_job(token: str) -> Optional[Dict[str, Any]]:
+    with _saved_exports_lock:
+        job = _saved_exports.get(token)
+        return dict(job) if isinstance(job, dict) else None
+
+
+def _export_update_job(token: str, patch: Dict[str, Any]) -> None:
+    with _saved_exports_lock:
+        if token not in _saved_exports:
+            return
+        _saved_exports[token].update(patch)
+
+
+def _export_remove_job(token: str) -> Optional[Dict[str, Any]]:
+    with _saved_exports_lock:
+        return _saved_exports.pop(token, None)
+
+
+def _export_is_cancelled(token: str) -> bool:
+    with _saved_exports_lock:
+        job = _saved_exports.get(token) or {}
+        return bool(job.get("cancelled"))
+
+
+def _build_orders_where_and_params(conn, table: str, args: Dict[str, str]) -> tuple[str, List[Any]]:
+    """Build WHERE clause identical to api_orders_export()."""
+    start_date = (args.get("start_date") or "").strip()
+    end_date = (args.get("end_date") or "").strip()
+    f_source = (args.get("source") or "").strip()
+    f_qty = (args.get("qty") or "").strip()
+    f_market = (args.get("market") or "").strip()
+
+    col_info = conn.execute(f"DESCRIBE {table}").fetchall()
+    cols = [str(c[0]) for c in col_info]
+    where_clauses: List[str] = []
+    params: List[Any] = []
+
+    date_col = next(
+        (
+            c
+            for c in [
+                "Date - Order Date",
+                "Date - Paid Date",
+                "Date - Paid",
+                "Date - Shipped Date",
+                "order_date",
+                "OrderDate",
+                "date",
+                "Date",
+                "open-date",
+            ]
+            if c in cols
+        ),
+        None,
+    )
+    if date_col:
+        date_parse_sql = f"""
+            COALESCE(
+                TRY_CAST(TRIM("{date_col}") AS DATE),
+                TRY_CAST(strptime(SPLIT_PART(TRIM("{date_col}"), ' ', 1), '%m/%d/%Y') AS DATE),
+                TRY_CAST(
+                    SPLIT_PART(SPLIT_PART(TRIM("{date_col}"), ' ', 1), '/', 3) || '-' || 
+                    LPAD(SPLIT_PART(SPLIT_PART(TRIM("{date_col}"), ' ', 1), '/', 1), 2, '0') || '-' || 
+                    LPAD(SPLIT_PART(SPLIT_PART(TRIM("{date_col}"), ' ', 1), '/', 2), 2, '0')
+                AS DATE)
+            )
+        """
+        if start_date:
+            where_clauses.append(f"{date_parse_sql} >= ?")
+            params.append(start_date)
+        if end_date:
+            where_clauses.append(f"{date_parse_sql} <= ?")
+            params.append(end_date)
+
+    if f_source:
+        s_col = next((c for c in ["Source", "source"] if c in cols), None)
+        if s_col:
+            parts = [p.strip() for p in str(f_source).split(",") if p.strip()]
+            if len(parts) == 1:
+                where_clauses.append(f'CAST("{s_col}" AS VARCHAR) ILIKE ?')
+                params.append(f"%{parts[0]}%")
+            elif len(parts) > 1:
+                where_clauses.append(
+                    "(" + " OR ".join([f'CAST("{s_col}" AS VARCHAR) ILIKE ?' for _ in parts]) + ")"
+                )
+                params.extend([f"%{p}%" for p in parts])
+
+    if f_qty:
+        q_col = next((c for c in ["Item - Qty"] if c in cols), None)
+        if q_col:
+            try:
+                qn = int(float(f_qty))
+            except Exception:
+                qn = 0
+            where_clauses.append(f'COALESCE(TRY_CAST("{q_col}" AS INTEGER), 0) >= ?')
+            params.append(qn)
+
+    if f_market:
+        mv = str(f_market).strip().upper()
+        c_country = next((c for c in ["Ship To - Country", "ShipToCountry", "country"] if c in cols), None)
+        c_mp = next((c for c in ["Market - Markeplace Name", "Marketplace", "marketplace"] if c in cols), None)
+        if mv in ("UK", "GB"):
+            if c_country:
+                where_clauses.append(f'UPPER(TRIM(CAST("{c_country}" AS VARCHAR))) = ?')
+                params.append("GB")
+            elif c_mp:
+                where_clauses.append(f'CAST("{c_mp}" AS VARCHAR) ILIKE ?')
+                params.append("%UK%")
+        elif mv in ("US", "USA", "OTHER"):
+            if c_country:
+                where_clauses.append(f'UPPER(TRIM(CAST("{c_country}" AS VARCHAR))) != ?')
+                params.append("GB")
+            elif c_mp:
+                where_clauses.append(f'CAST("{c_mp}" AS VARCHAR) NOT ILIKE ?')
+                params.append("%UK%")
+        else:
+            m_col = next((c for c in ["Market - Store Name", "market", "channel"] if c in cols), None)
+            if m_col:
+                parts = [p.strip() for p in str(f_market).split(",") if p.strip()]
+                if len(parts) == 1:
+                    where_clauses.append(f'CAST("{m_col}" AS VARCHAR) ILIKE ?')
+                    params.append(f"%{parts[0]}%")
+                elif len(parts) > 1:
+                    where_clauses.append(
+                        "(" + " OR ".join([f'CAST("{m_col}" AS VARCHAR) ILIKE ?' for _ in parts]) + ")"
+                    )
+                    params.extend([f"%{p}%" for p in parts])
+
+    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+    return where_sql, params
+
+
+def _build_products_where_and_params(conn, table: str, args: Dict[str, str]) -> tuple[str, List[str], str, List[Any]]:
+    """Build (columns_shown, select_sql, where_sql, params) identical to api_products_export()."""
+    search = (args.get("search") or "").strip()
+    f_brand = (args.get("source") or "").strip()
+    f_cat = (args.get("market") or "").strip()
+
+    col_info = conn.execute(f"DESCRIBE {table}").fetchall()
+    cols = [str(c[0]) for c in col_info]
+    cols_shown = cols[:]
+    if table == "product_database" and ("Product-Code" in cols_shown) and ("Product Code" in cols_shown):
+        cols_shown = [c for c in cols_shown if c != "Product-Code"]
+
+    where_clauses: List[str] = []
+    params: List[Any] = []
+    if search:
+        text_cols = [str(c[0]) for c in col_info if "VARCHAR" in str(c[1]) or "TEXT" in str(c[1])]
+        num_search = min(len(text_cols), 5)
+        if num_search > 0:
+            sliced_cols = [text_cols[i] for i in range(num_search)]
+            where_clauses.append("(" + " OR ".join([f'CAST("{c}" AS VARCHAR) ILIKE ?' for c in sliced_cols]) + ")")
+            params.extend([f"%{search}%"] * len(sliced_cols))
+    if f_brand:
+        b_col = next((c for c in ["Brand", "brand", "Supplier", "supplier", "Source", "source"] if c in cols), None)
+        if b_col:
+            where_clauses.append(f'"{b_col}" ILIKE ?')
+            params.append(f"%{f_brand}%")
+    if f_cat:
+        c_cols = [c for c in ["Department", "Category", "department", "category", "Niche", "niche", "Sub Niche"] if c in cols]
+        if c_cols:
+            where_clauses.append("(" + " OR ".join([f'CAST("{c}" AS VARCHAR) ILIKE ?' for c in c_cols]) + ")")
+            params.extend([f"%{f_cat}%"] * len(c_cols))
+
+    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+    select_cols_sql = ", ".join([f'"{c}"' for c in cols_shown]) if cols_shown else "*"
+    return cols_shown, select_cols_sql, where_sql, params
+
+
+def _build_joined_queries(conn_l, args: Dict[str, str]) -> tuple[str, str, List[Any]]:
+    """Build (data_query, count_query, params) using the same SQL as the Joined UI."""
+    filters = _parse_joined_filter_args(args)
+    base_query, params, use_order_cache = _build_joined_unified_base_query(conn_l, filters)
+    if use_order_cache:
+        _register_joined_order_cache(conn_l)
+    data_query = base_query + ' ORDER BY "Sold Qty" ASC, Title ASC'
+    count_query = f"SELECT COUNT(*) FROM ({base_query}) q"
+    return data_query, count_query, params
+
+
+def _run_background_export(token: str, export_type: str, args: Dict[str, str]) -> None:
+    path = ""
+    try:
+        job = _export_get_job(token) or {}
+        path = str(job.get("path") or "")
+        if not path:
+            raise RuntimeError("Export path missing")
+        if _export_is_cancelled(token):
+            raise RuntimeError("Cancelled")
+
+        if export_type == "orders":
+            table = get_first_table("orders")
+            if not table:
+                raise RuntimeError("Orders database not found")
+            conn = get_connection("orders")
+            if not conn:
+                raise RuntimeError("Orders connection failed")
+            try:
+                where_sql, params = _build_orders_where_and_params(conn, table, args)
+                total = int(conn.execute(f"SELECT COUNT(*) FROM {table} {where_sql}", params).fetchone()[0])
+                _export_update_job(token, {"total": total})
+                cur = conn.execute(f"SELECT * FROM {table} {where_sql}", params)
+                out_cols = [d[0] for d in (cur.description or [])]
+                with open(path, "w", newline="", encoding="utf-8") as f:
+                    w = csv.writer(f)
+                    w.writerow(out_cols)
+                    rows_written = 0
+                    while True:
+                        if _export_is_cancelled(token):
+                            raise RuntimeError("Cancelled")
+                        rows = cur.fetchmany(5000)
+                        if not rows:
+                            break
+                        w.writerows(rows)
+                        rows_written += len(rows)
+                        _export_update_job(token, {"rows": rows_written})
+                _export_update_job(token, {"ready": True})
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        elif export_type == "products":
+            table = "product_database" if os.path.exists(UNIFIED_DB) else get_first_table("products")
+            conn = get_connection("products")
+            if not conn:
+                raise RuntimeError("Products connection failed")
+            try:
+                cols_shown, select_cols_sql, where_sql, params = _build_products_where_and_params(conn, table, args)
+                total = int(conn.execute(f"SELECT COUNT(*) FROM {table} {where_sql}", params).fetchone()[0])
+                _export_update_job(token, {"total": total})
+                cur = conn.execute(f"SELECT {select_cols_sql} FROM {table} {where_sql}", params)
+                out_cols = cols_shown if cols_shown else [d[0] for d in (cur.description or [])]
+                with open(path, "w", newline="", encoding="utf-8") as f:
+                    w = csv.writer(f)
+                    w.writerow(out_cols)
+                    rows_written = 0
+                    while True:
+                        if _export_is_cancelled(token):
+                            raise RuntimeError("Cancelled")
+                        rows = cur.fetchmany(5000)
+                        if not rows:
+                            break
+                        w.writerows(rows)
+                        rows_written += len(rows)
+                        _export_update_job(token, {"rows": rows_written})
+                _export_update_job(token, {"ready": True})
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        elif export_type == "joined":
+            # Same constraints as the existing export route.
+            if not loader.use_unified:
+                raise RuntimeError("Joined export is only supported in unified mode for this build.")
+            conn_l = get_connection("active_listings")
+            conn_o = get_connection("orders")
+            conn_c = get_connection("catalogue")
+            if not conn_l:
+                raise RuntimeError("active_listings.duckdb not found")
+            if not conn_o:
+                raise RuntimeError("shipstation_orders.duckdb not found")
+            try:
+                filters = _parse_joined_filter_args(args)
+                base_query, params, use_order_cache = _build_joined_unified_base_query(conn_l, filters)
+                data_query = base_query + ' ORDER BY "Sold Qty" ASC, Title ASC'
+                try:
+                    _duckdb_spill_for_joined(conn_l)
+                except Exception:
+                    pass
+                if use_order_cache:
+                    _register_joined_order_cache(conn_l)
+                total = 0
+                try:
+                    total = int(conn_l.execute(f"SELECT COUNT(*) FROM ({base_query}) q", params).fetchone()[0])
+                except Exception as e:
+                    print(f"[joined export COUNT skipped]: {e}")
+                _export_update_job(token, {"total": total})
+                cur = conn_l.execute(data_query, params)
+                out_cols = [d[0] for d in (cur.description or [])]
+                with open(path, "w", newline="", encoding="utf-8") as f:
+                    w = csv.writer(f)
+                    w.writerow(out_cols)
+                    rows_written = 0
+                    while True:
+                        if _export_is_cancelled(token):
+                            raise RuntimeError("Cancelled")
+                        rows = cur.fetchmany(5000)
+                        if not rows:
+                            break
+                        w.writerows(rows)
+                        rows_written += len(rows)
+                        _export_update_job(token, {"rows": rows_written})
+                _export_update_job(token, {"ready": True, "total": rows_written})
+            finally:
+                try:
+                    conn_l.close()
+                except Exception:
+                    pass
+                try:
+                    conn_o.close()
+                except Exception:
+                    pass
+                try:
+                    conn_c.close()
+                except Exception:
+                    pass
+        else:
+            raise RuntimeError("Unknown export type")
+
+    except Exception as e:
+        msg = str(e)
+        if msg.strip().lower() == "cancelled":
+            try:
+                if path and os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+            _export_update_job(token, {"error": "Cancelled", "ready": False, "rows": 0, "total": 0})
+        else:
+            _export_update_job(token, {"error": msg, "ready": False})
+
+
+@app.route("/api/export/prepare", methods=["POST"])
+def api_export_prepare():
+    """Prepare a large CSV export in background."""
+    export_type = (request.args.get("type") or "").strip().lower()
+    if export_type not in ("orders", "products", "joined"):
+        return jsonify({"error": "Invalid export type"}), 400
+
+    token = str(uuid.uuid4())
+    tmp_path = os.path.join(tempfile.gettempdir(), f"export_{token}.csv")
+    filename = f"{export_type}_export.csv"
+
+    with _saved_exports_lock:
+        _saved_exports[token] = {
+            "path": tmp_path,
+            "filename": filename,
+            "ready": False,
+            "error": None,
+            "cancelled": False,
+            "rows": 0,
+            "total": 0,
+        }
+
+    args = dict(request.args)
+    t = threading.Thread(target=_run_background_export, args=(token, export_type, args), daemon=True)
+    t.start()
+    return jsonify({"token": token, "status": "preparing"})
+
+
+@app.route("/api/export/status/<token>")
+def api_export_status(token: str):
+    job = _export_get_job(token)
+    if not job:
+        return jsonify({"error": "Export not found or expired"}), 404
+    ready = bool(job.get("ready"))
+    error = job.get("error")
+    rows = int(job.get("rows") or 0)
+    total = int(job.get("total") or 0)
+    out = {
+        "ready": ready,
+        "rows": rows,
+        "total": total,
+        "error": error,
+        "filename": str(job.get("filename") or "export.csv"),
+        "cancelled": bool(job.get("cancelled")),
+    }
+    if ready and (not error):
+        out["download_url"] = f"/api/export/download/{token}"
+    return jsonify(out)
+
+
+@app.route("/api/export/cancel/<token>", methods=["POST"])
+def api_export_cancel(token: str):
+    job = _export_get_job(token)
+    if not job:
+        return jsonify({"error": "Export not found or expired"}), 404
+    _export_update_job(token, {"cancelled": True})
+    return jsonify({"ok": True})
+
+
+@app.route("/api/export/download/<token>")
+def api_export_download(token: str):
+    job = _export_get_job(token)
+    if not job:
+        return jsonify({"error": "Export not found or expired"}), 404
+    if not job.get("ready") or job.get("error"):
+        return jsonify({"error": "Export not ready"}), 409
+
+    path = str(job.get("path") or "")
+    filename = str(job.get("filename") or "export.csv")
+    if not path or (not os.path.exists(path)):
+        _export_remove_job(token)
+        return jsonify({"error": "Export not found or expired"}), 404
+
+    def _gen():
+        try:
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(256 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+        finally:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+            _export_remove_job(token)
+
+    return Response(
+        stream_with_context(_gen()),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+# ─── JOINED VIEW CACHES (Unified) ──────────────────────────────────────────────
+# When unified mode is enabled, get_connection() creates a fresh in-memory bridge
+# per request. Scanning the full orders table on every request can OOM/time out,
+# especially when the user filters by Source/Mock without a date range.
+_joined_cache_lock = threading.Lock()
+_joined_cache: Dict[str, Any] = {
+    "unified_mtime": None,
+    "order_agg_alltime_df": None,  # base_sku, sold_qty, last_order_date
+    "order_agg_building": False,
+    "order_agg_build_error": None,
+}
+
+
+def _get_unified_mtime() -> Optional[float]:
+    try:
+        p = getattr(loader, "unified_path", "") or ""
+        if p and os.path.exists(p):
+            return float(os.path.getmtime(p))
+    except Exception:
+        return None
+    return None
+
+
+def _get_order_agg_alltime_df(conn: duckdb.DuckDBPyConnection) -> "pd.DataFrame":
+    """
+    Build (once per process per unified DB mtime) the all-time sold summary by base_sku.
+    This avoids scanning unified orders for every Joined request (major OOM/timeout source).
+    """
+    mtime = _get_unified_mtime()
+    with _joined_cache_lock:
+        if _joined_cache.get("unified_mtime") == mtime and _joined_cache.get("order_agg_alltime_df") is not None:
+            return _joined_cache["order_agg_alltime_df"]
+
+    # Build outside the lock (can be heavy)
+    date_expr = (
+        "COALESCE("
+        "TRY_CAST(SUBSTR(TRIM(\"Date - Order Date\"), 1, 10) AS DATE),"
+        "TRY_STRPTIME(SUBSTR(TRIM(\"Date - Order Date\"), 1, 10), '%Y-%m-%d'),"
+        "TRY_STRPTIME(SUBSTR(TRIM(\"Date - Order Date\"), 1, 10), '%m/%d/%Y'),"
+        "TRY_STRPTIME(SUBSTR(TRIM(\"Date - Order Date\"), 1, 10), '%d/%m/%Y')"
+        ")"
+    )
+    df = conn.execute(
+        f"""
+        SELECT
+          SPLIT_PART(LOWER(TRIM(CAST(sku AS VARCHAR))), '-', 1) AS base_sku,
+          SUM(COALESCE(TRY_CAST("Item - Qty" AS INTEGER), 1)) AS sold_qty,
+          MAX({date_expr})::VARCHAR AS last_order_date
+        FROM unified_db.unified_data
+        WHERE source_type = 'order'
+          AND sku IS NOT NULL
+          AND TRIM(CAST(sku AS VARCHAR)) != ''
+        GROUP BY 1
+        """
+    ).fetchdf()
+
+    with _joined_cache_lock:
+        _joined_cache["unified_mtime"] = mtime
+        _joined_cache["order_agg_alltime_df"] = df
+        _joined_cache["order_agg_building"] = False
+        _joined_cache["order_agg_build_error"] = None
+    return df
+
+
+def _ensure_order_agg_cache_async() -> bool:
+    """
+    Ensure the all-time orders cache is built. If not built yet, kick off a background build and return False.
+    Returns True if cache is ready.
+    """
+    mtime = _get_unified_mtime()
+    with _joined_cache_lock:
+        if _joined_cache.get("unified_mtime") == mtime and _joined_cache.get("order_agg_alltime_df") is not None:
+            return True
+        if _joined_cache.get("order_agg_building"):
+            return False
+        # start build
+        _joined_cache["order_agg_building"] = True
+        _joined_cache["order_agg_build_error"] = None
+
+    def _build():
+        try:
+            con = loader.get_connection()
+            if not con:
+                raise RuntimeError("No unified connection available for cache build")
+            try:
+                _duckdb_spill_for_joined(con)
+                _get_order_agg_alltime_df(con)
+            finally:
+                try:
+                    con.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            with _joined_cache_lock:
+                _joined_cache["order_agg_building"] = False
+                _joined_cache["order_agg_build_error"] = str(e)
+
+    t = threading.Thread(target=_build, daemon=True)
+    t.start()
+    return False
 
 @app.template_filter('fmt')
 def fmt_filter(n):
@@ -276,6 +867,29 @@ _DESIGN_IMAGES_CACHE: dict[str, Any] = {
 def _design_images_signature(paths: List[str]) -> tuple:
     return tuple(_file_signature(p) for p in paths)
 
+def _design_images_part_paths() -> List[str]:
+    """Resolve Excel image index paths (portable across dev + ZIP layouts)."""
+    names = [f"Import Design Images-Part-{i}.xlsx" for i in range(1, 5)]
+    roots: List[str] = [BASE_DIR]
+    parent = os.path.dirname(BASE_DIR)
+    if parent and os.path.abspath(parent) not in {os.path.abspath(BASE_DIR)}:
+        roots.append(parent)
+    root_override = os.environ.get("ECOM_DASHBOARD_ROOT", "").strip()
+    if root_override:
+        roots.append(os.path.abspath(root_override))
+    parts: List[str] = []
+    seen: set[str] = set()
+    for root in roots:
+        for name in names:
+            p = os.path.join(root, "Files", name)
+            ap = os.path.abspath(p)
+            if ap in seen:
+                continue
+            seen.add(ap)
+            parts.append(p)
+    return parts
+
+
 def _load_design_images_index() -> Dict[str, str]:
     """
     Build mapping from design_code/base_sku -> image_url from:
@@ -283,12 +897,7 @@ def _load_design_images_index() -> Dict[str, str]:
 
     Observed columns: design_code, image_url
     """
-    parts = [
-        os.path.join(BASE_DIR, "Files", "Import Design Images-Part-1.xlsx"),
-        os.path.join(BASE_DIR, "Files", "Import Design Images-Part-2.xlsx"),
-        os.path.join(BASE_DIR, "Files", "Import Design Images-Part-3.xlsx"),
-        os.path.join(BASE_DIR, "Files", "Import Design Images-Part-4.xlsx"),
-    ]
+    parts = _design_images_part_paths()
     sig = _design_images_signature(parts)
     if _DESIGN_IMAGES_CACHE.get("signature") == sig and isinstance(_DESIGN_IMAGES_CACHE.get("map"), dict):
         return _DESIGN_IMAGES_CACHE["map"]
@@ -321,12 +930,99 @@ def _load_design_images_index() -> Dict[str, str]:
     _DESIGN_IMAGES_CACHE["map"] = out
     return out
 
+def _map_images_for_sku_series(sku_series: "pd.Series", img_map: Dict[str, str]) -> "pd.Series":
+    """
+    Map SKU/design ids to image urls using multiple common key variants.
+    Excel keys are often like `12345lg` while SKUs can be `12345`, `12345LG`, `12345-LG`, etc.
+    """
+    s0 = sku_series.astype(str).fillna("").str.strip().str.rstrip(".").str.lower()
+    base = s0.str.split("-", n=1).str[0]
+    digits = base.str.extract(r"^(\d+)", expand=False).fillna("")
+
+    # Try in order: exact base, base+lg, digits, digits+lg
+    out = base.map(img_map)
+    out = out.fillna((base + "lg").map(img_map))
+    out = out.fillna(digits.map(img_map))
+    out = out.fillna((digits + "lg").map(img_map))
+    return out.fillna("")
+
+
+def _enrich_image_column(
+    data_df: pd.DataFrame,
+    sku_col: str = "SKU",
+    image_col: str = "Image",
+) -> pd.DataFrame:
+    """Fill empty Image cells from Excel design index (listing rows often lack URLs in DB)."""
+    if data_df is None or data_df.empty or sku_col not in data_df.columns:
+        return data_df
+    try:
+        img_map = _load_design_images_index()
+        if not img_map:
+            return data_df
+        mapped = _map_images_for_sku_series(data_df[sku_col], img_map)
+        if image_col not in data_df.columns:
+            data_df.insert(0, image_col, mapped)
+            return data_df
+        cur = data_df[image_col].astype(str).fillna("").str.strip()
+        empty = (
+            cur.eq("")
+            | cur.str.lower().isin(("nan", "none", "null"))
+        )
+        if empty.any():
+            data_df.loc[empty, image_col] = mapped[empty]
+    except Exception as e:
+        print(f"[design_images enrich] {e}")
+    return data_df
+
+
+@app.route("/api/debug/image_lookup")
+def api_debug_image_lookup():
+    """Debug: show how an SKU maps to image URL via Excel index."""
+    sku = (request.args.get("sku", "") or "").strip()
+    if not sku:
+        return jsonify({"error": "missing sku"}), 400
+    try:
+        img_map = _load_design_images_index()
+        s0 = str(sku).strip().rstrip(".").lower()
+        base = s0.split("-", 1)[0]
+        import re
+        m = re.match(r"^(\d+)", base)
+        digits = m.group(1) if m else ""
+        candidates = [base, base + "lg", digits, digits + "lg"]
+        tried = []
+        found = ""
+        for k in candidates:
+            if not k:
+                continue
+            v = img_map.get(k, "")
+            tried.append({"key": k, "hit": bool(v)})
+            if v and not found:
+                found = v
+        return jsonify(
+            {
+                "sku": sku,
+                "candidates": candidates,
+                "tried": tried,
+                "found_url": found,
+                "map_size": len(img_map or {}),
+            }
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 def _file_signature(path: str) -> tuple[str, bool, float]:
     """Return a cheap signature for cache invalidation."""
     try:
         return (path, os.path.exists(path), os.path.getmtime(path) if os.path.exists(path) else 0.0)
     except Exception:
         return (path, os.path.exists(path), 0.0)
+
+
+def _df_to_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """DataFrame → list of dicts with NaN/NaT as null (valid JSON for jsonify)."""
+    if df is None or df.empty:
+        return []
+    return json.loads(df.to_json(orient="records", date_format="iso"))
 
 
 def _get_unified_orders_date_range() -> Optional[Dict[str, Any]]:
@@ -438,6 +1134,355 @@ def _resolve_sub_source_column(cols: List[str]) -> Optional[str]:
 
 
 # ─── DB HELPER ─────────────────────────────────────────────────────────────────
+
+def _duckdb_spill_for_joined(con: duckdb.DuckDBPyConnection) -> None:
+    """
+    Unified mode uses an in-memory DuckDB bridge; large joins can OOM without spill.
+    Best-effort PRAGMAs (safe to skip if unsupported).
+    """
+    import tempfile
+
+    try:
+        lim = os.environ.get("DUCKDB_JOINED_MEMORY_LIMIT", "").strip() or "4GB"
+        con.execute(f"PRAGMA memory_limit='{lim}'")
+    except Exception as e:
+        print(f"[duckdb] memory_limit skipped: {e}")
+    # Temp spill directory can be fragile on some Windows setups (AV/cleanup races).
+    # Only set it when explicitly provided via env var.
+    td = os.environ.get("DUCKDB_TEMP_DIRECTORY", "").strip()
+    if td:
+        try:
+            os.makedirs(td, exist_ok=True)
+            td_sql = td.replace("\\", "/")
+            con.execute(f"PRAGMA temp_directory='{td_sql}'")
+        except Exception as e:
+            print(f"[duckdb] temp_directory skipped: {e}")
+
+
+def _split_csv_joined(v: str) -> List[str]:
+    return [x.strip() for x in str(v or "").split(",") if str(x or "").strip()]
+
+
+def _parse_joined_filter_args(args: Dict[str, str]) -> Dict[str, Any]:
+    """Normalize joined filter args from request/export job dict."""
+    market = (args.get("market") or "").strip().lower()
+    search = (args.get("search") or "").strip()
+    min_sold = (args.get("min_sold") or "").strip()
+    max_sold = (args.get("max_sold") or "").strip()
+    start_date = (args.get("start_date") or "").strip()
+    end_date = (args.get("end_date") or "").strip()
+    f_listing_source = (args.get("source") or "").strip()
+    mock_id = (args.get("mock_id") or "").strip()
+
+    if (
+        not min_sold
+        and not max_sold
+        and not search
+        and not f_listing_source
+        and not mock_id
+        and not market
+    ):
+        min_sold = "1"
+
+    return {
+        "market_list": [x.lower() for x in _split_csv_joined(market)],
+        "search": search,
+        "min_sold": min_sold,
+        "max_sold": max_sold,
+        "start_date": start_date,
+        "end_date": end_date,
+        "source_list": _split_csv_joined(f_listing_source),
+        "mock_list": _split_csv_joined(mock_id),
+    }
+
+
+def _register_joined_order_cache(conn_l: duckdb.DuckDBPyConnection) -> None:
+    try:
+        _df_orders = _get_order_agg_alltime_df(conn_l)
+        conn_l.register("order_agg_cache", _df_orders)
+    except Exception as e:
+        print(f"[joined_cache] order_agg_cache failed: {e}")
+
+
+def _build_joined_unified_base_query(
+    conn_l: duckdb.DuckDBPyConnection,
+    filters: Dict[str, Any],
+) -> tuple[str, List[Any], bool]:
+    """
+    Build the Joined SQL (no ORDER BY). Returns (base_query, params, use_order_cache).
+    Matches /api/listings_with_sales unified logic so UI + exports stay consistent.
+    """
+    schema = "unified_db"
+    market_list: List[str] = filters.get("market_list") or []
+    search: str = filters.get("search") or ""
+    min_sold: str = filters.get("min_sold") or ""
+    max_sold: str = filters.get("max_sold") or ""
+    start_date: str = filters.get("start_date") or ""
+    end_date: str = filters.get("end_date") or ""
+    source_list: List[str] = filters.get("source_list") or []
+    mock_list: List[str] = filters.get("mock_list") or []
+
+    try:
+        ud_cols = [str(c[0]) for c in conn_l.execute(f'DESCRIBE {schema}.unified_data').fetchall()]
+    except Exception:
+        ud_cols = []
+
+    mock_col = None
+    for candidate in ["Mockup Identifier", "mockup_identifier", "Mock ID", "mock_id"]:
+        if candidate in ud_cols:
+            mock_col = candidate
+            break
+    mock_expr = f'TRIM(CAST("{mock_col}" AS VARCHAR))' if mock_col else "''"
+
+    _cat_title_candidates = [
+        "Product-Name",
+        "Product Name",
+        "eBay Title",
+        "Amazon Title",
+        "ETSY Title",
+        "Website Title",
+    ]
+    _cat_parts: List[str] = []
+    for c in _cat_title_candidates:
+        if c in ud_cols:
+            _cat_parts.append(f'NULLIF(TRIM(CAST("{c}" AS VARCHAR)), \'\')')
+    cat_title_expr = "COALESCE(" + ", ".join(_cat_parts) + ", '')" if _cat_parts else "''"
+
+    mkt_filter_sql = ""
+    mkt_params: List[Any] = []
+    if market_list:
+        parts: List[str] = []
+        for m in market_list:
+            if m in ("ebay", "e-bay"):
+                parts.append("l.marketplace = 'eBay'")
+            elif m == "amazon":
+                parts.append("l.marketplace = 'Amazon'")
+            elif m == "etsy":
+                parts.append("l.marketplace = 'Etsy'")
+            else:
+                parts.append("LOWER(COALESCE(l.store_name,'')) LIKE ?")
+                mkt_params.append(f"%{m}%")
+        if parts:
+            mkt_filter_sql = "AND (" + " OR ".join(parts) + ")"
+
+    date_expr = (
+        "COALESCE("
+        'TRY_CAST(SUBSTR(TRIM("Date - Order Date"), 1, 10) AS DATE),'
+        "TRY_STRPTIME(SUBSTR(TRIM(\"Date - Order Date\"), 1, 10), '%Y-%m-%d'),"
+        "TRY_STRPTIME(SUBSTR(TRIM(\"Date - Order Date\"), 1, 10), '%m/%d/%Y'),"
+        "TRY_STRPTIME(SUBSTR(TRIM(\"Date - Order Date\"), 1, 10), '%d/%m/%Y')"
+        ")"
+    )
+    order_where_parts = ["source_type = 'order'", "sku IS NOT NULL", "TRIM(CAST(sku AS VARCHAR)) != ''"]
+    order_params: List[Any] = []
+    if start_date:
+        order_where_parts.append(f"{date_expr} >= ?")
+        order_params.append(start_date)
+    if end_date:
+        order_where_parts.append(f"{date_expr} <= ?")
+        order_params.append(end_date)
+    order_where_sql = "WHERE " + " AND ".join(order_where_parts)
+
+    sold_filter_parts: List[str] = []
+    if min_sold.isdigit():
+        sold_filter_parts.append(f"COALESCE(o.sold_qty, 0) >= {int(min_sold)}")
+    if max_sold.isdigit():
+        sold_filter_parts.append(f"COALESCE(o.sold_qty, 0) <= {int(max_sold)}")
+    sold_filter_sql = (" AND " + " AND ".join(sold_filter_parts)) if sold_filter_parts else ""
+
+    order_having_parts: List[str] = []
+    if min_sold.isdigit():
+        order_having_parts.append(
+            f'SUM(COALESCE(TRY_CAST("Item - Qty" AS INTEGER), 1)) >= {int(min_sold)}'
+        )
+    if max_sold.isdigit():
+        order_having_parts.append(
+            f'SUM(COALESCE(TRY_CAST("Item - Qty" AS INTEGER), 1)) <= {int(max_sold)}'
+        )
+    order_having_sql = ("HAVING " + " AND ".join(order_having_parts)) if order_having_parts else ""
+
+    search_sql = ""
+    search_params: List[Any] = []
+    if search:
+        like_search = f"%{search.lower()}%"
+        if mock_col:
+            mock_like_expr = f'LOWER(COALESCE(TRIM(CAST(d."{mock_col}" AS VARCHAR)), \'\')) LIKE ?'
+        else:
+            mock_like_expr = 'LOWER(COALESCE(TRIM(CAST(d."Mock ID" AS VARCHAR)), \'\')) LIKE ?'
+        search_sql = f"""
+            AND (
+                LOWER(l.raw_sku) LIKE ?
+                OR l.base_sku LIKE ?
+                OR LOWER(l.title) LIKE ?
+                OR LOWER(COALESCE(d.Source,'')) LIKE ?
+                OR {mock_like_expr}
+            )
+        """
+        search_params.extend([like_search, like_search, like_search, like_search, like_search])
+
+    design_dim_where_sql = ""
+    design_dim_where_params: List[Any] = []
+    if source_list:
+        src_parts: List[str] = []
+        for s in source_list:
+            src_parts.append("LOWER(COALESCE(TRIM(CAST(Source AS VARCHAR)), '')) LIKE ?")
+            design_dim_where_params.append(f"%{s.lower()}%")
+        design_dim_where_sql += " AND (" + " OR ".join(src_parts) + ")"
+    if mock_list:
+        _mq = f'"{mock_col}"' if mock_col else '"Mock ID"'
+        mk_parts: List[str] = []
+        for mid in mock_list:
+            if "%" in mid:
+                mk_parts.append(f"LOWER(COALESCE(TRIM(CAST({_mq} AS VARCHAR)), '')) LIKE ?")
+                design_dim_where_params.append(mid.lower())
+            else:
+                mk_parts.append(f"LOWER(TRIM(CAST({_mq} AS VARCHAR))) = LOWER(TRIM(?))")
+                design_dim_where_params.append(mid)
+        design_dim_where_sql += " AND (" + " OR ".join(mk_parts) + ")"
+
+    design_narrow = bool(design_dim_where_sql.strip())
+    design_dim_listing_scope_sql = ""
+    if not design_narrow:
+        design_dim_listing_scope_sql = """
+              AND LOWER(TRIM(CAST(\"Design ID\" AS VARCHAR))) IN (SELECT base_sku FROM listing_skus)"""
+
+    listings_head = f"""
+        WITH listings AS (
+            SELECT
+              'eBay' AS marketplace,
+              TRIM(CAST(\"Custom label (SKU)\" AS VARCHAR)) AS raw_sku,
+              SPLIT_PART(LOWER(TRIM(CAST(\"Custom label (SKU)\" AS VARCHAR))), '-', 1) AS base_sku,
+              TRIM(CAST(Title AS VARCHAR)) AS title,
+              CAST(\"Current price\" AS VARCHAR) AS price,
+              CAST(\"Available quantity\" AS VARCHAR) AS available_qty,
+              CAST(\"Market - Store Name\" AS VARCHAR) AS store_name,
+              '' AS asin
+            FROM {schema}.active_listings_ebay
+            WHERE \"Custom label (SKU)\" IS NOT NULL AND TRIM(CAST(\"Custom label (SKU)\" AS VARCHAR)) != ''
+
+            UNION ALL
+            SELECT
+              'Amazon' AS marketplace,
+              TRIM(CAST(\"seller-sku\" AS VARCHAR)) AS raw_sku,
+              SPLIT_PART(LOWER(TRIM(CAST(\"seller-sku\" AS VARCHAR))), '-', 1) AS base_sku,
+              TRIM(CAST(Title AS VARCHAR)) AS title,
+              CAST(price AS VARCHAR) AS price,
+              CAST(quantity AS VARCHAR) AS available_qty,
+              CAST(\"Market - Store Name\" AS VARCHAR) AS store_name,
+              TRIM(CAST(ASIN AS VARCHAR)) AS asin
+            FROM {schema}.active_listings_amazon
+            WHERE \"seller-sku\" IS NOT NULL AND TRIM(CAST(\"seller-sku\" AS VARCHAR)) != ''
+
+            UNION ALL
+            SELECT
+              'Etsy' AS marketplace,
+              TRIM(CAST(SKU AS VARCHAR)) AS raw_sku,
+              SPLIT_PART(LOWER(TRIM(CAST(SKU AS VARCHAR))), '-', 1) AS base_sku,
+              TRIM(CAST(Title AS VARCHAR)) AS title,
+              CAST(price AS VARCHAR) AS price,
+              CAST(quantity AS VARCHAR) AS available_qty,
+              CAST(\"Market - Store Name\" AS VARCHAR) AS store_name,
+              '' AS asin
+            FROM {schema}.active_listings_etsy
+            WHERE SKU IS NOT NULL AND TRIM(CAST(SKU AS VARCHAR)) != ''
+        ),
+        listing_skus AS (
+            SELECT DISTINCT base_sku FROM listings
+        ),
+    """
+
+    design_dim_cte = f"""
+        design_dim AS (
+            SELECT
+              LOWER(TRIM(CAST(\"Design ID\" AS VARCHAR))) AS base_sku,
+              ANY_VALUE(TRIM(CAST(Source AS VARCHAR))) AS Source,
+              ANY_VALUE(TRIM(CAST(Niche AS VARCHAR))) AS Niche,
+              ANY_VALUE(TRIM(CAST(\"Sub Niche\" AS VARCHAR))) AS \"Sub Niche\",
+              ANY_VALUE(COALESCE(NULLIF(TRIM(CAST(\"Item - Image URL\" AS VARCHAR)), ''), NULLIF(TRIM(CAST(IMAGE1 AS VARCHAR)), ''))) AS Image,
+              ANY_VALUE(TRIM(CAST(\"Design ID\" AS VARCHAR))) AS \"Product Code\",
+              ANY_VALUE(COALESCE(NULLIF({mock_expr}, ''), '')) AS \"Mock ID\",
+              ANY_VALUE({cat_title_expr}) AS \"Catalogue Title\"
+            FROM {schema}.unified_data
+            WHERE \"Design ID\" IS NOT NULL AND TRIM(CAST(\"Design ID\" AS VARCHAR)) != ''
+              AND source_type <> 'order'
+              {design_dim_listing_scope_sql}
+              {design_dim_where_sql}
+            GROUP BY 1
+        )
+    """
+
+    use_order_cache = (not start_date and not end_date and not design_narrow)
+    order_agg_cte = ""
+    if not use_order_cache:
+        order_agg_cte = f"""
+        order_agg AS (
+            SELECT
+              SPLIT_PART(LOWER(TRIM(CAST(sku AS VARCHAR))), '-', 1) AS base_sku,
+              SUM(COALESCE(TRY_CAST(\"Item - Qty\" AS INTEGER), 1)) AS sold_qty,
+              MAX({date_expr})::VARCHAR AS last_order_date
+            FROM {schema}.unified_data
+            {order_where_sql}
+              AND SPLIT_PART(LOWER(TRIM(CAST(sku AS VARCHAR))), '-', 1) IN (
+                SELECT base_sku FROM {"design_dim" if design_narrow else "listing_skus"}
+              )
+            GROUP BY 1
+            {order_having_sql}
+        )
+    """
+
+    if use_order_cache:
+        mid_ctes = design_dim_cte
+    elif design_narrow:
+        mid_ctes = design_dim_cte + "," + order_agg_cte
+    else:
+        mid_ctes = order_agg_cte + "," + design_dim_cte
+
+    base_query = (
+        listings_head
+        + mid_ctes
+        + f"""
+        SELECT
+          d.Image AS Image,
+          l.marketplace AS Marketplace,
+          l.raw_sku AS SKU,
+          l.asin AS ASIN,
+          l.title AS Title,
+          l.title AS "Listing Title",
+          COALESCE(d."Catalogue Title", '') AS "Catalogue Title",
+          l.price AS Price,
+          COALESCE(d.Niche, '') AS Niche,
+          COALESCE(d.\"Sub Niche\", '') AS \"Sub Niche\",
+          COALESCE(d.\"Product Code\", '') AS \"Product Code\",
+          COALESCE(d.\"Mock ID\", '') AS \"Mock ID\",
+          l.available_qty AS \"Available Qty\",
+          COALESCE(o.sold_qty, 0) AS \"Sold Qty\",
+          COALESCE(o.last_order_date, '') AS \"Last Order Date\",
+          COALESCE(d.Source, '') AS Source
+        FROM listings l
+        LEFT JOIN {"order_agg_cache" if use_order_cache else "order_agg"} o ON l.base_sku = o.base_sku
+        LEFT JOIN design_dim d ON l.base_sku = d.base_sku
+        WHERE 1=1
+          {mkt_filter_sql}
+          {sold_filter_sql}
+          {search_sql}
+    """
+    )
+
+    _design_join_kw = "INNER JOIN" if design_dim_where_sql.strip() else "LEFT JOIN"
+    base_query = base_query.replace(
+        "LEFT JOIN design_dim d ON l.base_sku = d.base_sku",
+        f"{_design_join_kw} design_dim d ON l.base_sku = d.base_sku",
+    )
+
+    if use_order_cache:
+        params = design_dim_where_params + mkt_params + search_params
+    elif design_narrow:
+        params = design_dim_where_params + order_params + mkt_params + search_params
+    else:
+        params = order_params + design_dim_where_params + mkt_params + search_params
+
+    return base_query, params, use_order_cache
+
 
 def get_connection(db_key: str):
     """Open a read-only connection to a DuckDB file."""
@@ -824,9 +1869,35 @@ def get_tables(db_key: str) -> List[Dict[str, Any]]:
     table_info: List[Dict[str, Any]] = []
     try:
         tables = conn.execute("SHOW TABLES").fetchall()
+        all_names = [str(name) for (name,) in tables]
+
+        # Unified mode uses a single in-memory bridge with many views.
+        # DB Explorer should show only the tables relevant to the selected db_key.
+        if loader.use_unified:
+            allow: List[str] = []
+            if db_key == "products":
+                allow = ["product_database", "products", "catalogue", "catalogue_02_database"]
+            elif db_key == "active_listings":
+                allow = ["active_listings", "active_listings_amazon", "active_listings_ebay", "active_listings_etsy"]
+            elif db_key == "orders":
+                allow = ["orders"]
+            elif db_key == "catalogue":
+                allow = ["catalogue", "catalogue_02_database", "product_database"]
+            elif db_key == "trends":
+                allow = ["trend_listing"]
+            elif db_key == "unified_raw":
+                # Raw unified table (view) with all original columns
+                allow = ["unified_data"]
+            else:
+                # fallback: show everything for unknown keys
+                allow = all_names
+
+            allow_set = {a.lower() for a in allow}
+            tables = [(n,) for n in all_names if str(n).lower() in allow_set]
+
         for (name,) in tables:
-            cols = conn.execute(f"DESCRIBE {name}").fetchall()
-            row_count_res = conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()
+            cols = conn.execute(f'DESCRIBE "{name}"').fetchall()
+            row_count_res = conn.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()
             count = int(row_count_res[0]) if row_count_res else 0
             table_info.append({
                 "name": name,
@@ -967,6 +2038,52 @@ def niche_details():
 
 @app.route("/api/niche_management")
 def api_niche_management():
+    # Unified mode: read directly from unified_db.unified_data (reliable across dist/zip)
+    if getattr(loader, "use_unified", False) and os.path.exists(UNIFIED_DB):
+        conn_u = None
+        try:
+            conn_u = duckdb.connect(UNIFIED_DB, read_only=True)
+            cols = [str(c[0]) for c in conn_u.execute('DESCRIBE "unified_data"').fetchall()]
+
+            c_sku = next((c for c in ["Design ID", "design_id", "Product Code", "Product-Code", "SKU", "sku"] if c in cols), None)
+            c_niche = next((c for c in ["Niche", "niche", "Department", "Product Category", "category"] if c in cols), None)
+            c_sub = next((c for c in ["Sub Niche", "Sub-Niche", "sub_niche", "SubNiche", "Sub-Department"] if c in cols), None)
+
+            if not c_sku or not c_niche:
+                return jsonify({"error": "Unified DB: required columns missing for Niche Management"})
+
+            # Some unified DBs have different/non-standard source_type values.
+            # Filtering by source_type can accidentally hide all rows, so keep this unfiltered.
+            where_src = ""
+
+            niche_expr = f'REGEXP_REPLACE(TRIM(CAST("{c_niche}" AS VARCHAR)), \'^"+|"+$\', \'\')'
+            sub_expr = (
+                f'REGEXP_REPLACE(TRIM(CAST("{c_sub}" AS VARCHAR)), \'^"+|"+$\', \'\')'
+                if c_sub
+                else "''"
+            )
+            data = conn_u.execute(f"""
+                SELECT
+                    {niche_expr} AS Niche,
+                    {sub_expr} AS SubNiche,
+                    COUNT(DISTINCT TRIM(CAST("{c_sku}" AS VARCHAR))) AS DesignsCount
+                FROM unified_data
+                WHERE "{c_niche}" IS NOT NULL AND {niche_expr} != ''
+                {where_src}
+                GROUP BY 1, 2
+                ORDER BY Niche ASC, SubNiche ASC
+            """).fetchdf()
+
+            return jsonify(_df_to_records(data))
+        except Exception as e:
+            return jsonify({"error": str(e)})
+        finally:
+            try:
+                if conn_u is not None:
+                    conn_u.close()
+            except Exception:
+                pass
+
     # Attempt to connect to catalogue OR products DB to get Niche/SubNiche metrics
     conn_p = None
     db_key = None
@@ -1024,9 +2141,10 @@ def api_niche_management():
             WHERE "{c_niche}" IS NOT NULL AND TRIM(CAST("{c_niche}" AS VARCHAR)) != ''
             GROUP BY 1, 2
             ORDER BY Niche ASC, SubNiche ASC
-        """).fetchdf().to_dict(orient="records")
+        """).fetchdf()
 
         # Save to cache (JSON-serializable list of dicts)
+        data = _df_to_records(data)
         _NICHE_MGMT_CACHE["signature"] = sig
         _NICHE_MGMT_CACHE["data"] = data
         return jsonify(data)
@@ -1040,6 +2158,89 @@ def api_niche_management():
 def api_niche_items():
     niche = request.args.get("niche", "").strip()
     sub_niche = request.args.get("sub_niche", "").strip()
+
+    def _normalize_image_url(u: str) -> str:
+        s = (u or "").strip().strip('"').strip("'")
+        if not s:
+            return ""
+        # Handle common "www." URLs.
+        if s.lower().startswith("www."):
+            s = "https://" + s
+        # Convert Google Drive share links to direct content when possible.
+        if "drive.google.com" in s:
+            try:
+                import re
+                m = re.search(r"/file/d/([^/]+)", s)
+                if m:
+                    s = f"https://drive.google.com/uc?export=view&id={m.group(1)}"
+            except Exception:
+                pass
+        return s
+
+    # Unified mode: pull items from unified_data (portable and consistent)
+    if getattr(loader, "use_unified", False) and os.path.exists(UNIFIED_DB):
+        conn_u = None
+        try:
+            conn_u = duckdb.connect(UNIFIED_DB, read_only=True)
+            cols = [str(c[0]) for c in conn_u.execute('DESCRIBE "unified_data"').fetchall()]
+
+            c_sku = next((c for c in ["Design ID", "design_id", "Product Code", "Product-Code", "SKU", "sku"] if c in cols), None)
+            c_niche = next((c for c in ["Niche", "niche", "Department", "Product Category", "category"] if c in cols), None)
+            c_sub = next((c for c in ["Sub Niche", "Sub-Niche", "sub_niche", "SubNiche", "Sub-Department"] if c in cols), None)
+            c_title = next((c for c in ["eBay Title", "Amazon Title", "ETSY Title", "Website Title", "Title", "title", "Product Name", "Name"] if c in cols), None)
+            c_img = next((c for c in ["Item - Image URL", "IMAGE1", "Image", "image"] if c in cols), None)
+
+            if not c_sku or not c_niche or not c_sub:
+                return jsonify({"error": "Unified DB: required columns missing for Niche Items"})
+
+            niche_expr = f'REGEXP_REPLACE(TRIM(CAST("{c_niche}" AS VARCHAR)), \'^"+|"+$\', \'\')'
+            sub_expr = f'REGEXP_REPLACE(TRIM(CAST("{c_sub}" AS VARCHAR)), \'^"+|"+$\', \'\')'
+            data = conn_u.execute(f"""
+                SELECT
+                    TRIM(CAST("{c_sku}" AS VARCHAR)) AS sku,
+                    TRIM(CAST("{c_title}" AS VARCHAR)) AS title,
+                    TRIM(CAST("{c_img}" AS VARCHAR)) AS image
+                FROM unified_data
+                WHERE {niche_expr} = ?
+                  AND {sub_expr} = ?
+                LIMIT 200
+            """, [niche, sub_niche]).fetchdf().fillna("").to_dict(orient="records")
+
+            # Fallback: if unified_data doesn't contain usable image URLs, load from Excel index
+            img_map = {}
+            try:
+                img_map = _load_design_images_index()
+            except Exception:
+                img_map = {}
+
+            # Normalize minimal fields expected by the UI
+            out = []
+            for r in data:
+                sku_raw = (r.get("sku") or "").strip()
+                img_raw = _normalize_image_url((r.get("image") or "").strip())
+                if not img_raw and img_map and sku_raw:
+                    try:
+                        mapped = _map_images_for_sku_series(pd.Series([sku_raw]), img_map).iloc[0]
+                        if mapped:
+                            img_raw = _normalize_image_url(str(mapped))
+                    except Exception:
+                        pass
+                out.append(
+                    {
+                        "sku": sku_raw,
+                        "title": (r.get("title") or "").strip() or "—",
+                        "image": img_raw,
+                    }
+                )
+            return jsonify(out)
+        except Exception as e:
+            return jsonify({"error": str(e)})
+        finally:
+            try:
+                if conn_u is not None:
+                    conn_u.close()
+            except Exception:
+                pass
     
     conn_p = None
     if os.path.exists(CATALOGUE_DB):
@@ -1085,13 +2286,52 @@ def api_niche_items():
                 df.insert(0, "image", base_series.map(img_map).fillna(""))
         except Exception as ie:
             print(f"[NICHE ITEMS IMAGE ERROR]: {ie}")
-        data = df.to_dict(orient="records")
-        return jsonify(data)
+        return jsonify(_df_to_records(df))
     except Exception as e:
         print(f"[NICHE ITEMS ERROR]: {e}")
         return jsonify([])
     finally:
         if conn_p: conn_p.close()
+
+@app.route("/api/image_proxy")
+def api_image_proxy():
+    """
+    Fetch a remote image and serve it through this origin.
+    This avoids hotlink/referrer blocks and makes <img> loading more reliable.
+    """
+    url = (request.args.get("url", "") or "").strip()
+    if not url:
+        return Response("Missing url", status=400, mimetype="text/plain")
+    if url.lower().startswith("www."):
+        url = "https://" + url
+    if not (url.lower().startswith("http://") or url.lower().startswith("https://")):
+        return Response("Only http/https urls are allowed", status=400, mimetype="text/plain")
+
+    try:
+        r = requests.get(
+            url,
+            stream=True,
+            timeout=(10, 30),
+            headers={
+                "User-Agent": "Mozilla/5.0 (ecom-dashboard image proxy)",
+                "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            },
+            allow_redirects=True,
+        )
+        if r.status_code != 200:
+            return Response(f"Upstream HTTP {r.status_code}", status=502, mimetype="text/plain")
+
+        ct = (r.headers.get("content-type") or "").split(";")[0].strip().lower()
+        if not ct:
+            guess, _ = mimetypes.guess_type(url)
+            ct = guess or "application/octet-stream"
+
+        data = r.content
+        resp = Response(data, status=200, mimetype=ct)
+        resp.headers["Cache-Control"] = "public, max-age=86400"
+        return resp
+    except Exception as e:
+        return Response(f"Proxy error: {e}", status=502, mimetype="text/plain")
 
 @app.route("/products")
 def products():
@@ -1116,7 +2356,11 @@ def trends():
 @app.route("/explorer")
 def explorer():
     """Raw database explorer."""
-    return render_template("explorer.html", db_files=list(DB_FILES.keys()))
+    dbs = list(DB_FILES.keys())
+    # Unified mode: expose raw unified_data for full columns
+    if loader.use_unified and "unified_raw" not in dbs:
+        dbs.append("unified_raw")
+    return render_template("explorer.html", db_files=dbs)
 
 
 # ─── API: PRODUCTS ──────────────────────────────────────────────────────────────
@@ -1130,13 +2374,21 @@ def api_products():
     f_brand = request.args.get("source", "").strip()
     f_cat = request.args.get("market", "").strip()
 
-    table = get_first_table("products")
+    # Unified mode: use the `product_database` view (built over unified_data).
+    # Multi-DB mode: fall back to first table in products DB.
+    table = "product_database" if os.path.exists(UNIFIED_DB) else get_first_table("products")
     if not table: return jsonify({"data": [], "total": 0})
     conn = get_connection("products")
     if conn is None: return jsonify({"data": [], "total": 0})
     try:
         col_info = conn.execute(f"DESCRIBE {table}").fetchall()
         cols = [str(c[0]) for c in col_info]
+        # Unified-mode compatibility: product_database view exposes both "Product-Code" and "Product Code"
+        # (same underlying design id). Return only one to avoid duplicate columns in UI/export.
+        cols_shown = cols[:]
+        if table == "product_database" and ("Product-Code" in cols_shown) and ("Product Code" in cols_shown):
+            # Prefer the space variant as the canonical display name
+            cols_shown = [c for c in cols_shown if c != "Product-Code"]
         where_clauses = []
         params: List[Any] = []
         if search:
@@ -1147,16 +2399,24 @@ def api_products():
                 where_clauses.append("(" + " OR ".join([f'CAST("{c}" AS VARCHAR) ILIKE ?' for c in sliced_cols]) + ")")
                 params.extend([f"%{search}%"] * len(sliced_cols))
         if f_brand:
-            b_col = next((c for c in ["Brand", "brand", "Supplier"] if c in cols), None)
+            # Unified `product_database` view uses `Source` as the closest “brand/supplier/source” concept.
+            b_col = next((c for c in ["Brand", "brand", "Supplier", "supplier", "Source", "source"] if c in cols), None)
             if b_col: where_clauses.append(f'"{b_col}" ILIKE ?'); params.append(f"%{f_brand}%")
         if f_cat:
-            c_col = next((c for c in ["Department", "Category", "department", "category"] if c in cols), None)
-            if c_col: where_clauses.append(f'"{c_col}" ILIKE ?'); params.append(f"%{f_cat}%")
+            # Unified `product_database` view uses Niche/Sub Niche.
+            c_cols = [c for c in ["Department", "Category", "department", "category", "Niche", "niche", "Sub Niche", "SubNiche", "sub_niche"] if c in cols]
+            if c_cols:
+                where_clauses.append("(" + " OR ".join([f'CAST(\"{c}\" AS VARCHAR) ILIKE ?' for c in c_cols]) + ")")
+                params.extend([f"%{f_cat}%"] * len(c_cols))
 
         where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
-        data = conn.execute(f"SELECT * FROM {table} {where_sql} LIMIT {per_page} OFFSET {offset}", params).fetchdf().to_dict(orient="records")
+        select_cols_sql = ", ".join([f'"{c}"' for c in cols_shown]) if cols_shown else "*"
+        data = conn.execute(
+            f"SELECT {select_cols_sql} FROM {table} {where_sql} LIMIT {per_page} OFFSET {offset}",
+            params
+        ).fetchdf().to_dict(orient="records")
         total = int(conn.execute(f"SELECT COUNT(*) FROM {table} {where_sql}", params).fetchone()[0])
-        return jsonify({"data": data, "total": total, "columns": cols})
+        return jsonify({"data": data, "total": total, "columns": cols_shown})
     except Exception as e: return jsonify({"error": str(e), "data": []})
     finally:
         if conn is not None: conn.close()
@@ -1166,36 +2426,91 @@ def api_products_export():
     search = request.args.get("search", "").strip()
     f_brand = request.args.get("source", "").strip()
     f_cat = request.args.get("market", "").strip()
-    table = get_first_table("products")
-    conn = get_connection("products")
-    if conn is not None:
-        try:
-            col_info = conn.execute(f"DESCRIBE {table}").fetchall()
-            cols = [str(c[0]) for c in col_info]
-            where_clauses = []
-            params = []
-            if search:
-                text_cols = [str(c[0]) for c in col_info if 'VARCHAR' in str(c[1]) or 'TEXT' in str(c[1])]
-                num_search = min(len(text_cols), 5)
-                if num_search > 0:
-                    sliced_cols = [text_cols[i] for i in range(num_search)]
-                    where_clauses.append("(" + " OR ".join([f'CAST("{c}" AS VARCHAR) ILIKE ?' for c in sliced_cols]) + ")")
-                    params.extend([f"%{search}%"] * len(sliced_cols))
-            if f_brand:
-                b_col = next((c for c in ["Brand", "brand"] if c in cols), None)
-                if b_col: where_clauses.append(f'"{b_col}" ILIKE ?'); params.append(f"%{f_brand}%")
-            if f_cat:
-                c_col = next((c for c in ["Department", "Category"] if c in cols), None)
-                if c_col: where_clauses.append(f'"{c_col}" ILIKE ?'); params.append(f"%{f_cat}%")
-            where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
-            data_df = conn.execute(f"SELECT * FROM {table} {where_sql} LIMIT 5000", params).fetchdf()
-            output = io.StringIO(); data_df.to_csv(output, index=False)
-            return Response(output.getvalue(), mimetype="text/csv", headers={"Content-disposition": "attachment; filename=products_export.csv"})
-        except Exception as e: return str(e), 500
-        finally:
-            conn.close()
-    return "Connection failed", 500
+    all_flag = request.args.get("all", "0").strip().lower() in ("1", "true", "yes")
 
+    table = "product_database" if os.path.exists(UNIFIED_DB) else get_first_table("products")
+    conn = get_connection("products")
+    if not conn:
+        return "Connection failed", 500
+
+    streaming = False
+    try:
+        col_info = conn.execute(f"DESCRIBE {table}").fetchall()
+        cols = [str(c[0]) for c in col_info]
+        cols_shown = cols[:]
+        if table == "product_database" and ("Product-Code" in cols_shown) and ("Product Code" in cols_shown):
+            cols_shown = [c for c in cols_shown if c != "Product-Code"]
+
+        where_clauses = []
+        params = []
+        if search:
+            text_cols = [str(c[0]) for c in col_info if 'VARCHAR' in str(c[1]) or 'TEXT' in str(c[1])]
+            num_search = min(len(text_cols), 5)
+            if num_search > 0:
+                sliced_cols = [text_cols[i] for i in range(num_search)]
+                where_clauses.append("(" + " OR ".join([f'CAST("{c}" AS VARCHAR) ILIKE ?' for c in sliced_cols]) + ")")
+                params.extend([f"%{search}%"] * len(sliced_cols))
+        if f_brand:
+            b_col = next((c for c in ["Brand", "brand", "Supplier", "supplier", "Source", "source"] if c in cols), None)
+            if b_col:
+                where_clauses.append(f'"{b_col}" ILIKE ?')
+                params.append(f"%{f_brand}%")
+        if f_cat:
+            c_cols = [c for c in ["Department", "Category", "department", "category", "Niche", "niche", "Sub Niche"] if c in cols]
+            if c_cols:
+                where_clauses.append("(" + " OR ".join([f'CAST("{c}" AS VARCHAR) ILIKE ?' for c in c_cols]) + ")")
+                params.extend([f"%{f_cat}%"] * len(c_cols))
+
+        where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+        select_cols_sql = ", ".join([f'"{c}"' for c in cols_shown]) if cols_shown else "*"
+
+        if all_flag:
+            # ✅ STREAMING — unlimited export, low memory
+            streaming = True
+            cur = conn.execute(f"SELECT {select_cols_sql} FROM {table} {where_sql}", params)
+            out_cols = [d[0] for d in (cur.description or [])]
+
+            def _gen():
+                out = io.StringIO()
+                w = csv.writer(out)
+                try:
+                    w.writerow(out_cols)
+                    yield out.getvalue()
+                    out.seek(0); out.truncate(0)
+                    while True:
+                        rows = cur.fetchmany(2000)  # 2000 rows per chunk
+                        if not rows:
+                            break
+                        w.writerows(rows)
+                        yield out.getvalue()
+                        out.seek(0); out.truncate(0)
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+            return Response(
+                stream_with_context(_gen()),
+                mimetype="text/csv",
+                headers={"Content-disposition": "attachment; filename=products_export.csv"}
+            )
+        else:
+            # Preview: max 5000
+            data_df = conn.execute(f"SELECT {select_cols_sql} FROM {table} {where_sql} LIMIT 5000", params).fetchdf()
+            output = io.StringIO()
+            data_df.to_csv(output, index=False)
+            return Response(output.getvalue(), mimetype="text/csv",
+                          headers={"Content-disposition": "attachment; filename=products_export.csv"})
+
+    except Exception as e:
+        return str(e), 500
+    finally:
+        if not streaming and conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 @app.route("/api/products/summary")
 def api_products_summary():
@@ -1352,18 +2667,53 @@ def api_orders():
         if f_source:
              s_col = next((c for c in ["Source", "source"] if c in cols), None)
              if s_col:
-                 where_clauses.append(f'"{s_col}" ILIKE ?')
-                 params.append(f"%{f_source}%")
+                 parts = [p.strip() for p in str(f_source).split(",") if p.strip()]
+                 if len(parts) == 1:
+                     where_clauses.append(f'CAST("{s_col}" AS VARCHAR) ILIKE ?')
+                     params.append(f"%{parts[0]}%")
+                 elif len(parts) > 1:
+                     where_clauses.append("(" + " OR ".join([f'CAST("{s_col}" AS VARCHAR) ILIKE ?' for _ in parts]) + ")")
+                     params.extend([f"%{p}%" for p in parts])
         if f_qty:
              q_col = next((c for c in ["Item - Qty", "Quantity", "qty"] if c in cols), None)
              if q_col:
-                 where_clauses.append(f'CAST("{q_col}" AS INTEGER) = ?')
-                 params.append(int(f_qty) if f_qty.isdigit() else 0)
+                 # MIN QTY (>=)
+                 try:
+                     qn = int(float(f_qty))
+                 except Exception:
+                     qn = 0
+                 where_clauses.append(f'COALESCE(TRY_CAST("{q_col}" AS INTEGER), 0) >= ?')
+                 params.append(qn)
         if f_market:
-             m_col = next((c for c in ["Market - Store Name", "market", "channel"] if c in cols), None)
-             if m_col:
-                 where_clauses.append(f'"{m_col}" ILIKE ?')
-                 params.append(f"%{f_market}%")
+             # UI uses UK vs US/Other; prefer country column if present.
+             mv = str(f_market).strip().upper()
+             c_country = next((c for c in ["Ship To - Country", "ShipToCountry", "country"] if c in cols), None)
+             c_mp = next((c for c in ["Market - Markeplace Name", "Marketplace", "marketplace"] if c in cols), None)
+             if mv in ("UK", "GB"):
+                 if c_country:
+                     where_clauses.append(f'UPPER(TRIM(CAST("{c_country}" AS VARCHAR))) = ?')
+                     params.append("GB")
+                 elif c_mp:
+                     where_clauses.append(f'CAST("{c_mp}" AS VARCHAR) ILIKE ?')
+                     params.append("%UK%")
+             elif mv in ("US", "USA", "OTHER"):
+                 if c_country:
+                     # "US / Other" means everything except GB
+                     where_clauses.append(f'UPPER(TRIM(CAST("{c_country}" AS VARCHAR))) != ?')
+                     params.append("GB")
+                 elif c_mp:
+                     where_clauses.append(f'CAST("{c_mp}" AS VARCHAR) NOT ILIKE ?')
+                     params.append("%UK%")
+             else:
+                 m_col = next((c for c in ["Market - Store Name", "market", "channel"] if c in cols), None)
+                 if m_col:
+                     parts = [p.strip() for p in str(f_market).split(",") if p.strip()]
+                     if len(parts) == 1:
+                         where_clauses.append(f'CAST("{m_col}" AS VARCHAR) ILIKE ?')
+                         params.append(f"%{parts[0]}%")
+                     elif len(parts) > 1:
+                         where_clauses.append("(" + " OR ".join([f'CAST("{m_col}" AS VARCHAR) ILIKE ?' for _ in parts]) + ")")
+                         params.extend([f"%{p}%" for p in parts])
 
         where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
 
@@ -1380,9 +2730,8 @@ def api_orders():
             if img_map:
                 c_sku_any = next((c for c in ["Item - SKU", "Item - Fill SKU", "asin", "ASIN", "sku", "seller-sku"] if c in cols), None)
                 if c_sku_any and c_sku_any in data_df.columns:
-                    sku_series = data_df[c_sku_any].astype(str)
-                    base_series = sku_series.str.strip().str.lower().str.split("-", n=1).str[0]
-                    data_df.insert(0, "Image", base_series.map(img_map).fillna(""))
+                    mapped = _map_images_for_sku_series(data_df[c_sku_any], img_map)
+                    data_df.insert(0, "Image", mapped)
         except Exception as e:
             print(f"[orders design_images] mapping error: {e}")
 
@@ -1493,12 +2842,15 @@ def api_orders_export():
     f_source = request.args.get("source", "").strip()
     f_qty = request.args.get("qty", "").strip()
     f_market = request.args.get("market", "").strip()
+    all_flag = request.args.get("all", "0").strip().lower() in ("1", "true", "yes")
 
     table = get_first_table("orders")
     if not table: return "Database not found", 404
 
     conn = get_connection("orders")
-    if not conn: return "Connection failed", 500
+    if not conn:
+        return "Connection failed", 500
+    streaming = False
     
     try:
         col_info = conn.execute(f"DESCRIBE {table}").fetchall()
@@ -1527,31 +2879,108 @@ def api_orders_export():
                 where_clauses.append(f"{date_parse_sql} <= ?")
                 params.append(end_date)
         if f_source:
-            s_col = next((c for c in ["Source"] if c in cols), None)
-            if s_col: where_clauses.append(f'"{s_col}" ILIKE ?'); params.append(f"%{f_source}%")
+            s_col = next((c for c in ["Source", "source"] if c in cols), None)
+            if s_col:
+                # Support multi-select: source can be comma-separated (e.g. "amazon_uk,ebay_uk")
+                parts = [p.strip() for p in str(f_source).split(",") if p.strip()]
+                if len(parts) == 1:
+                    where_clauses.append(f'CAST("{s_col}" AS VARCHAR) ILIKE ?')
+                    params.append(f"%{parts[0]}%")
+                elif len(parts) > 1:
+                    where_clauses.append("(" + " OR ".join([f'CAST("{s_col}" AS VARCHAR) ILIKE ?' for _ in parts]) + ")")
+                    params.extend([f"%{p}%" for p in parts])
         if f_qty:
             q_col = next((c for c in ["Item - Qty"] if c in cols), None)
-            if q_col: where_clauses.append(f'CAST("{q_col}" AS INTEGER) = ?'); params.append(int(f_qty) if f_qty.isdigit() else 0)
+            # MIN QTY (>=)
+            if q_col:
+                try:
+                    qn = int(float(f_qty))
+                except Exception:
+                    qn = 0
+                where_clauses.append(f'COALESCE(TRY_CAST("{q_col}" AS INTEGER), 0) >= ?')
+                params.append(qn)
         if f_market:
-            m_col = next((c for c in ["Market - Store Name"] if c in cols), None)
-            if m_col: where_clauses.append(f'"{m_col}" ILIKE ?'); params.append(f"%{f_market}%")
+            mv = str(f_market).strip().upper()
+            c_country = next((c for c in ["Ship To - Country", "ShipToCountry", "country"] if c in cols), None)
+            c_mp = next((c for c in ["Market - Markeplace Name", "Marketplace", "marketplace"] if c in cols), None)
+            if mv in ("UK", "GB"):
+                if c_country:
+                    where_clauses.append(f'UPPER(TRIM(CAST("{c_country}" AS VARCHAR))) = ?')
+                    params.append("GB")
+                elif c_mp:
+                    where_clauses.append(f'CAST("{c_mp}" AS VARCHAR) ILIKE ?')
+                    params.append("%UK%")
+            elif mv in ("US", "USA", "OTHER"):
+                if c_country:
+                    where_clauses.append(f'UPPER(TRIM(CAST("{c_country}" AS VARCHAR))) != ?')
+                    params.append("GB")
+                elif c_mp:
+                    where_clauses.append(f'CAST("{c_mp}" AS VARCHAR) NOT ILIKE ?')
+                    params.append("%UK%")
+            else:
+                m_col = next((c for c in ["Market - Store Name", "market", "channel"] if c in cols), None)
+                if m_col:
+                    parts = [p.strip() for p in str(f_market).split(",") if p.strip()]
+                    if len(parts) == 1:
+                        where_clauses.append(f'CAST("{m_col}" AS VARCHAR) ILIKE ?')
+                        params.append(f"%{parts[0]}%")
+                    elif len(parts) > 1:
+                        where_clauses.append("(" + " OR ".join([f'CAST("{m_col}" AS VARCHAR) ILIKE ?' for _ in parts]) + ")")
+                        params.extend([f"%{p}%" for p in parts])
 
         where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
         
-        # Limit export to 5000 rows for performance
-        data_df = conn.execute(f"SELECT * FROM {table} {where_sql} LIMIT 5000", params).fetchdf()
-        
-        output = io.StringIO()
-        data_df.to_csv(output, index=False)
-        return Response(
-            output.getvalue(),
-            mimetype="text/csv",
-            headers={"Content-disposition": "attachment; filename=filtered_orders.csv"}
-        )
+        if all_flag:
+            # Stream CSV to avoid RAM blow-ups on large exports
+            streaming = True
+            cur = conn.execute(f"SELECT * FROM {table} {where_sql}", params)
+            out_cols = [d[0] for d in (cur.description or [])]
+
+            def _gen():
+                out = io.StringIO()
+                w = csv.writer(out)
+                try:
+                    w.writerow(out_cols)
+                    yield out.getvalue()
+                    out.seek(0); out.truncate(0)
+                    while True:
+                        # Smaller batches = more frequent flushes (reduces timeouts/hangs)
+                        rows = cur.fetchmany(1000)
+                        if not rows:
+                            break
+                        w.writerows(rows)
+                        yield out.getvalue()
+                        out.seek(0); out.truncate(0)
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+            return Response(
+                stream_with_context(_gen()),
+                mimetype="text/csv",
+                headers={"Content-disposition": "attachment; filename=filtered_orders.csv"}
+            )
+        else:
+            # Safety limit when all=0
+            data_df = conn.execute(f"SELECT * FROM {table} {where_sql} LIMIT 5000", params).fetchdf()
+            output = io.StringIO()
+            data_df.to_csv(output, index=False)
+            return Response(
+                output.getvalue(),
+                mimetype="text/csv",
+                headers={"Content-disposition": "attachment; filename=filtered_orders.csv"}
+            )
     except Exception as e:
         return str(e), 500
     finally:
-        if conn is not None: conn.close()
+        # If streaming, connection is closed inside the generator once complete.
+        if (not streaming) and conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 @app.route("/api/orders/summary")
@@ -2237,6 +3666,14 @@ def api_listings_with_sales():
     start_date = request.args.get("start_date", "").strip()
     end_date = request.args.get("end_date", "").strip()
     f_listing_source = request.args.get("source", "").strip()
+    mock_id = request.args.get("mock_id", "").strip()
+
+    def _split_csv(v: str) -> List[str]:
+        return [x.strip() for x in str(v or "").split(",") if str(x or "").strip()]
+
+    market_list = [x.lower() for x in _split_csv(market)]
+    source_list = _split_csv(f_listing_source)
+    mock_list = _split_csv(mock_id)
 
     # Note: Joined view allows empty dates and empty sold filters (user choice).
 
@@ -2265,21 +3702,51 @@ def api_listings_with_sales():
         # Compute everything from unified_db.unified_data + unified listing views.
         if loader.use_unified:
             schema = "unified_db"
+            # Column presence detection (avoid referencing missing columns in SQL)
+            try:
+                ud_cols = [str(c[0]) for c in conn_l.execute(f'DESCRIBE {schema}.unified_data').fetchall()]
+            except Exception:
+                ud_cols = []
+
+            mock_col = None
+            for candidate in ["Mockup Identifier", "mockup_identifier", "Mock ID", "mock_id"]:
+                if candidate in ud_cols:
+                    mock_col = candidate
+                    break
+            mock_expr = f'TRIM(CAST("{mock_col}" AS VARCHAR))' if mock_col else "''"
+
+            # Optional catalogue/product title fields (if present in unified_data).
+            # Keep this separate from listing title to avoid "wrong title" confusion.
+            _cat_title_candidates = [
+                "Product-Name",
+                "Product Name",
+                "eBay Title",
+                "Amazon Title",
+                "ETSY Title",
+                "Website Title",
+            ]
+            _cat_parts: List[str] = []
+            for c in _cat_title_candidates:
+                if c in ud_cols:
+                    _cat_parts.append(f'NULLIF(TRIM(CAST("{c}" AS VARCHAR)), \'\')')
+            cat_title_expr = "COALESCE(" + ", ".join(_cat_parts) + ", '')" if _cat_parts else "''"
             # Marketplace vs store filter
-            m = market.strip().lower()
             mkt_filter_sql = ""
             mkt_params: List[Any] = []
-            if m:
-                if m in ("ebay", "e-bay"):
-                    mkt_filter_sql = "AND l.marketplace = 'eBay'"
-                elif m == "amazon":
-                    mkt_filter_sql = "AND l.marketplace = 'Amazon'"
-                elif m == "etsy":
-                    mkt_filter_sql = "AND l.marketplace = 'Etsy'"
-                else:
-                    # store-level filter (e.g. ebay4) against normalized_channel / Market - Store Name
-                    mkt_filter_sql = "AND LOWER(COALESCE(l.store_name,'')) LIKE ?"
-                    mkt_params.append(f"%{m}%")
+            if market_list:
+                parts: List[str] = []
+                for m in market_list:
+                    if m in ("ebay", "e-bay"):
+                        parts.append("l.marketplace = 'eBay'")
+                    elif m == "amazon":
+                        parts.append("l.marketplace = 'Amazon'")
+                    elif m == "etsy":
+                        parts.append("l.marketplace = 'Etsy'")
+                    else:
+                        parts.append("LOWER(COALESCE(l.store_name,'')) LIKE ?")
+                        mkt_params.append(f"%{m}%")
+                if parts:
+                    mkt_filter_sql = "AND (" + " OR ".join(parts) + ")"
 
             # Date parsing (unified order date is VARCHAR)
             date_expr = (
@@ -2323,24 +3790,54 @@ def api_listings_with_sales():
             search_params: List[Any] = []
             if search:
                 like_search = f"%{search.lower()}%"
-                search_sql = """
+                if mock_col:
+                    mock_like_expr = f'LOWER(COALESCE(TRIM(CAST(d."{mock_col}" AS VARCHAR)), \'\')) LIKE ?'
+                else:
+                    mock_like_expr = 'LOWER(COALESCE(TRIM(CAST(d."Mock ID" AS VARCHAR)), \'\')) LIKE ?'
+                search_sql = f"""
                 AND (
                     LOWER(l.raw_sku) LIKE ?
                     OR l.base_sku LIKE ?
                     OR LOWER(l.title) LIKE ?
                     OR LOWER(COALESCE(d.Source,'')) LIKE ?
+                    OR {mock_like_expr}
                 )
                 """
                 # source search always included in unified mode
-                search_params.extend([like_search, like_search, like_search, like_search])
+                search_params.extend([like_search, like_search, like_search, like_search, like_search])
 
-            src_filter_sql = ""
-            src_filter_params: List[Any] = []
-            if f_listing_source:
-                src_filter_sql = " AND LOWER(COALESCE(d.Source,'')) LIKE ?"
-                src_filter_params.append(f"%{f_listing_source.lower()}%")
+            # Source + Mock filters must be applied INSIDE design_dim (same unified_data row),
+            # otherwise ANY_VALUE(Source) and ANY_VALUE(Image/Mock) can come from different rows
+            # for the same Design ID — filters then look "wrong" vs the thumbnail.
+            design_dim_where_sql = ""
+            design_dim_where_params: List[Any] = []
+            if source_list:
+                src_parts: List[str] = []
+                for s in source_list:
+                    src_parts.append("LOWER(COALESCE(TRIM(CAST(Source AS VARCHAR)), '')) LIKE ?")
+                    design_dim_where_params.append(f"%{s.lower()}%")
+                design_dim_where_sql += " AND (" + " OR ".join(src_parts) + ")"
+            if mock_list:
+                _mq = f'"{mock_col}"' if mock_col else '"Mock ID"'
+                mk_parts: List[str] = []
+                for mid in mock_list:
+                    if "%" in mid:
+                        mk_parts.append(f"LOWER(COALESCE(TRIM(CAST({_mq} AS VARCHAR)), '')) LIKE ?")
+                        design_dim_where_params.append(mid.lower())
+                    else:
+                        mk_parts.append(f"LOWER(TRIM(CAST({_mq} AS VARCHAR))) = LOWER(TRIM(?))")
+                        design_dim_where_params.append(mid)
+                design_dim_where_sql += " AND (" + " OR ".join(mk_parts) + ")"
 
-            full_query = f"""
+            # When Source/Mock narrow design_dim, compute design_dim FIRST and scope order_agg to those SKUs.
+            # Otherwise design_dim is restricted to active listing SKUs (avoids unrelated design rows).
+            design_narrow = bool(design_dim_where_sql.strip())
+            design_dim_listing_scope_sql = ""
+            if not design_narrow:
+                design_dim_listing_scope_sql = """
+                      AND LOWER(TRIM(CAST(\"Design ID\" AS VARCHAR))) IN (SELECT base_sku FROM listing_skus)"""
+
+            listings_head = f"""
                 WITH listings AS (
                     SELECT
                       'eBay' AS marketplace,
@@ -2380,16 +3877,12 @@ def api_listings_with_sales():
                     FROM {schema}.active_listings_etsy
                     WHERE SKU IS NOT NULL AND TRIM(CAST(SKU AS VARCHAR)) != ''
                 ),
-                order_agg AS (
-                    SELECT
-                      SPLIT_PART(LOWER(TRIM(CAST(sku AS VARCHAR))), '-', 1) AS base_sku,
-                      SUM(COALESCE(TRY_CAST(\"Item - Qty\" AS INTEGER), 1)) AS sold_qty,
-                      MAX({date_expr})::VARCHAR AS last_order_date
-                    FROM {schema}.unified_data
-                    {order_where_sql}
-                    GROUP BY 1
-                    {order_having_sql}
+                listing_skus AS (
+                    SELECT DISTINCT base_sku FROM listings
                 ),
+"""
+
+            design_dim_cte = f"""
                 design_dim AS (
                     SELECT
                       LOWER(TRIM(CAST(\"Design ID\" AS VARCHAR))) AS base_sku,
@@ -2397,43 +3890,156 @@ def api_listings_with_sales():
                       ANY_VALUE(TRIM(CAST(Niche AS VARCHAR))) AS Niche,
                       ANY_VALUE(TRIM(CAST(\"Sub Niche\" AS VARCHAR))) AS \"Sub Niche\",
                       ANY_VALUE(COALESCE(NULLIF(TRIM(CAST(\"Item - Image URL\" AS VARCHAR)), ''), NULLIF(TRIM(CAST(IMAGE1 AS VARCHAR)), ''))) AS Image,
-                      ANY_VALUE(TRIM(CAST(\"Design ID\" AS VARCHAR))) AS \"Product Code\"
+                      ANY_VALUE(TRIM(CAST(\"Design ID\" AS VARCHAR))) AS \"Product Code\",
+                      ANY_VALUE(COALESCE(NULLIF({mock_expr}, ''), '')) AS \"Mock ID\",
+                      ANY_VALUE({cat_title_expr}) AS \"Catalogue Title\"
                     FROM {schema}.unified_data
                     WHERE \"Design ID\" IS NOT NULL AND TRIM(CAST(\"Design ID\" AS VARCHAR)) != ''
+                      AND source_type <> 'order'
+                      {design_dim_listing_scope_sql}
+                      {design_dim_where_sql}
                     GROUP BY 1
                 )
+"""
+
+            # For date-range queries we compute order_agg from unified_data.
+            # For all-time (no dates) we *can* join against a cached dataframe registered as order_agg_cache.
+            #
+            # IMPORTANT: when Source/Mock filters are active (design_narrow), the query is already narrow;
+            # building the all-time cache on the first request can take >180s and cause UI timeout.
+            # So we only use the cache for the broad (non-design_narrow) case.
+            use_order_cache = (not start_date and not end_date and not design_narrow)
+            order_agg_cte = ""
+            if not use_order_cache:
+                order_agg_cte = f"""
+                order_agg AS (
+                    SELECT
+                      SPLIT_PART(LOWER(TRIM(CAST(sku AS VARCHAR))), '-', 1) AS base_sku,
+                      SUM(COALESCE(TRY_CAST(\"Item - Qty\" AS INTEGER), 1)) AS sold_qty,
+                      MAX({date_expr})::VARCHAR AS last_order_date
+                    FROM {schema}.unified_data
+                    {order_where_sql}
+                      AND SPLIT_PART(LOWER(TRIM(CAST(sku AS VARCHAR))), '-', 1) IN (
+                        SELECT base_sku FROM {"design_dim" if design_narrow else "listing_skus"}
+                      )
+                    GROUP BY 1
+                    {order_having_sql}
+                )
+"""
+
+            if use_order_cache:
+                mid_ctes = design_dim_cte if design_narrow else design_dim_cte
+            else:
+                if design_narrow:
+                    mid_ctes = design_dim_cte + "," + order_agg_cte
+                else:
+                    mid_ctes = order_agg_cte + "," + design_dim_cte
+
+            full_query = (
+                listings_head
+                + mid_ctes
+                + f"""
                 SELECT
                   d.Image AS Image,
                   l.marketplace AS Marketplace,
                   l.raw_sku AS SKU,
                   l.asin AS ASIN,
                   l.title AS Title,
+                  l.title AS "Listing Title",
+                  COALESCE(d."Catalogue Title", '') AS "Catalogue Title",
                   l.price AS Price,
                   COALESCE(d.Niche, '') AS Niche,
                   COALESCE(d.\"Sub Niche\", '') AS \"Sub Niche\",
                   COALESCE(d.\"Product Code\", '') AS \"Product Code\",
+                  COALESCE(d.\"Mock ID\", '') AS \"Mock ID\",
                   l.available_qty AS \"Available Qty\",
                   COALESCE(o.sold_qty, 0) AS \"Sold Qty\",
                   COALESCE(o.last_order_date, '') AS \"Last Order Date\",
                   COALESCE(d.Source, '') AS Source
                 FROM listings l
-                LEFT JOIN order_agg o ON l.base_sku = o.base_sku
+                LEFT JOIN {"order_agg_cache" if use_order_cache else "order_agg"} o ON l.base_sku = o.base_sku
                 LEFT JOIN design_dim d ON l.base_sku = d.base_sku
                 WHERE 1=1
                   {mkt_filter_sql}
                   {sold_filter_sql}
-                  {src_filter_sql}
                   {search_sql}
-                ORDER BY \"Sold Qty\" ASC, l.title ASC
             """
+            )
 
-            params = mkt_params + order_params + src_filter_params + search_params
-            total = int(conn_l.execute(f"SELECT COUNT(*) FROM ({full_query}) q", params).fetchone()[0])
-            data_df = conn_l.execute(full_query + f" LIMIT {per_page} OFFSET {offset}", params).fetchdf()
+            # When Source/Mock filters are active, require a matching catalogue row (avoid NULL d.* rows).
+            _design_join_kw = "INNER JOIN" if design_dim_where_sql.strip() else "LEFT JOIN"
+
+            full_query = full_query.replace(
+                "LEFT JOIN design_dim d ON l.base_sku = d.base_sku",
+                f"{_design_join_kw} design_dim d ON l.base_sku = d.base_sku",
+            )
+
+            # SQL placeholder order depends on CTE order:
+            # - If we build design_dim before order_agg (design_narrow), placeholders for Source/Mock
+            #   come BEFORE date placeholders (order_agg).
+            # - If we are using the cached orders table (no dates), there are no order_params placeholders.
+            if use_order_cache:
+                params = design_dim_where_params + mkt_params + search_params
+            elif design_narrow:
+                params = design_dim_where_params + order_params + mkt_params + search_params
+            else:
+                params = order_params + design_dim_where_params + mkt_params + search_params
+            _duckdb_spill_for_joined(conn_l)
+            if use_order_cache:
+                # Build cache asynchronously to avoid 180s UI timeout on first run.
+                if not _ensure_order_agg_cache_async():
+                    with _joined_cache_lock:
+                        err = _joined_cache.get("order_agg_build_error")
+                    msg = "Preparing joined orders cache (first run). Please retry in ~15–60 seconds."
+                    if err:
+                        msg = f"Joined cache build failed: {err}"
+                    return jsonify({
+                        "error": msg,
+                        "data": [],
+                        "total": 0,
+                        "columns": ["Image", "Marketplace", "SKU", "ASIN", "Title", "Listing Title", "Catalogue Title", "Price", "Niche", "Sub Niche", "Product Code", "Mock ID", "Available Qty", "Sold Qty", "Last Order Date", "Source"],
+                    })
+                try:
+                    _df_orders = _get_order_agg_alltime_df(conn_l)
+                    conn_l.register("order_agg_cache", _df_orders)
+                except Exception as e:
+                    print(f"[joined_cache] order_agg_cache failed: {e}")
+            # Avoid COUNT(*) OVER() — it materializes the full wide join before LIMIT (OOM on large listings).
+            page_sql = f"""
+                SELECT * FROM ({full_query}) q
+                ORDER BY q.\"Sold Qty\" ASC, q.\"Title\" ASC
+                LIMIT {per_page} OFFSET {offset}
+            """
+            data_df = conn_l.execute(page_sql, params).fetchdf()
+            if len(data_df) == 0 and offset == 0:
+                total = 0
+            else:
+                # COUNT(*) on this join can be slower than the page query and frequently causes the
+                # client-side 180s abort. When the user applies a date range, prioritize returning
+                # the first page quickly and provide an estimated total (pagination is approximate).
+                if start_date or end_date:
+                    total = offset + int(len(data_df)) + (1 if len(data_df) >= per_page else 0)
+                else:
+                    try:
+                        total = int(conn_l.execute(f"SELECT COUNT(*) FROM ({full_query}) q", params).fetchone()[0])
+                    except Exception as e:
+                        # COUNT can still OOM on very large joins. Return the page and a conservative total
+                        # so the UI doesn't hard-fail. Pagination may be approximate in this rare case.
+                        msg = str(e)
+                        print(f"[listings_with_sales COUNT ERROR]: {msg}")
+                        if "Out of Memory" in msg or "Allocation failure" in msg:
+                            total = offset + int(len(data_df)) + (1 if len(data_df) >= per_page else 0)
+                        else:
+                            raise
+            # Listing rows in unified_data usually have no image URL; Excel index is the source.
+            data_df = _enrich_image_column(data_df, sku_col="SKU", image_col="Image")
+            # jsonify(data_df.to_dict(...)) can emit bare NaN values, which makes
+            # fetch(...).json() fail even though Flask returns HTTP 200.
+            records = json.loads(data_df.to_json(orient="records", date_format="iso"))
             return jsonify({
-                "data": data_df.to_dict(orient="records"),
+                "data": records,
                 "total": total,
-                "columns": ["Image", "Marketplace", "SKU", "ASIN", "Title", "Price", "Niche", "Sub Niche", "Product Code", "Available Qty", "Sold Qty", "Last Order Date", "Source"],
+                "columns": ["Image", "Marketplace", "SKU", "ASIN", "Title", "Listing Title", "Catalogue Title", "Price", "Niche", "Sub Niche", "Product Code", "Mock ID", "Available Qty", "Sold Qty", "Last Order Date", "Source"],
             })
 
         list_tables = [str(t[0]) for t in conn_l.execute("SHOW TABLES").fetchall()]
@@ -2710,6 +4316,15 @@ def api_listings_with_sales():
                     "ELSE NULLIF(c.website_title,'') "
                     "END, '') AS Title"
                 ) if cat_table else "l.title AS Title"},
+                l.title AS "Listing Title",
+                {(
+                    "CASE "
+                    "WHEN l.marketplace ILIKE 'ebay%' THEN COALESCE(NULLIF(c.ebay_title,''), '') "
+                    "WHEN l.marketplace ILIKE 'amazon%' THEN COALESCE(NULLIF(c.amazon_title,''), '') "
+                    "WHEN l.marketplace ILIKE 'etsy%' THEN COALESCE(NULLIF(c.etsy_title,''), '') "
+                    "ELSE COALESCE(NULLIF(c.website_title,''), '') "
+                    "END AS \"Catalogue Title\""
+                ) if cat_table else "'' AS \"Catalogue Title\""},
                 {(
                     "COALESCE(NULLIF(l.price,''), NULLIF(c.price_s2xl,''), '') AS Price"
                 ) if cat_table else "l.price AS Price"},
@@ -2750,15 +4365,7 @@ def api_listings_with_sales():
             if "__total_rows" in data_df.columns:
                 data_df = data_df.drop(columns=["__total_rows"])
 
-        # Add thumbnail URL column from Excel image index (design_code/base_sku → image_url)
-        try:
-            img_map = _load_design_images_index()
-            if img_map and "SKU" in data_df.columns:
-                sku_series = data_df["SKU"].astype(str)
-                base_series = sku_series.str.strip().str.lower().str.split("-", n=1).str[0]
-                data_df.insert(0, "Image", base_series.map(img_map).fillna(""))
-        except Exception as e:
-            print(f"[design_images] mapping error: {e}")
+        data_df = _enrich_image_column(data_df, sku_col="SKU", image_col="Image")
 
         # to_json → json.loads: NaN/NaT become null; keys match SELECT aliases exactly for the table renderer
         records = json.loads(data_df.to_json(orient="records", date_format="iso"))
@@ -2779,6 +4386,240 @@ def api_listings_with_sales():
             conn_o.close()
         if conn_c:
             conn_c.close()
+
+
+@app.route("/api/listings_with_sales/mock_ids")
+def api_joined_mock_ids():
+    """
+    Distinct Mock IDs for Joined view dropdown.
+    Returns: { "mock_ids": ["...", "..."] }
+    """
+    conn_l = get_connection("active_listings")
+    if not conn_l:
+        return jsonify({"mock_ids": []})
+
+    try:
+        f_source = request.args.get("source", "").strip()
+        src_list = [x.strip() for x in str(f_source or "").split(",") if str(x or "").strip()]
+        # Unified mode: use unified_db.unified_data if possible.
+        if loader.use_unified:
+            schema = "unified_db"
+            try:
+                ud_cols = [str(c[0]) for c in conn_l.execute(f'DESCRIBE {schema}.unified_data').fetchall()]
+            except Exception:
+                ud_cols = []
+
+            mock_col = None
+            for candidate in ["Mockup Identifier", "mockup_identifier", "Mock ID", "mock_id", "Mockup ID", "mockup_id"]:
+                if candidate in ud_cols:
+                    mock_col = candidate
+                    break
+            if not mock_col:
+                return jsonify({"mock_ids": []})
+
+            where_parts = [
+                f'"{mock_col}" IS NOT NULL',
+                f'TRIM(CAST("{mock_col}" AS VARCHAR)) != \'\'',
+                # orders don't carry mock/source/image dims; skipping them reduces work a lot
+                "source_type <> 'order'",
+            ]
+            params: List[Any] = []
+            if src_list:
+                src_parts: List[str] = []
+                for s in src_list:
+                    src_parts.append("LOWER(COALESCE(TRIM(CAST(Source AS VARCHAR)), '')) LIKE ?")
+                    params.append(f"%{s.lower()}%")
+                where_parts.append("(" + " OR ".join(src_parts) + ")")
+            where_sql = "WHERE " + " AND ".join(where_parts)
+
+            df = conn_l.execute(
+                f"""
+                SELECT DISTINCT TRIM(CAST("{mock_col}" AS VARCHAR)) AS v
+                FROM {schema}.unified_data
+                {where_sql}
+                ORDER BY 1
+                LIMIT 5000
+                """,
+                params,
+            ).fetchdf()
+            out = [str(x).strip() for x in (df["v"].tolist() if "v" in df.columns else []) if str(x).strip()]
+            return jsonify({"mock_ids": out})
+
+        # Non-unified: best-effort from catalogue DB if present
+        conn_c = get_connection("catalogue")
+        if not conn_c:
+            return jsonify({"mock_ids": []})
+        try:
+            cat_table = get_first_table("catalogue")
+            if not cat_table:
+                return jsonify({"mock_ids": []})
+            cols = [str(c[0]) for c in conn_c.execute(f'DESCRIBE "{cat_table}"').fetchall()]
+            mock_col = None
+            for candidate in ["Mockup Identifier", "mockup_identifier", "Mock ID", "mock_id", "Mockup ID", "mockup_id"]:
+                if candidate in cols:
+                    mock_col = candidate
+                    break
+            if not mock_col:
+                return jsonify({"mock_ids": []})
+            df = conn_c.execute(
+                f"""
+                SELECT DISTINCT TRIM(CAST("{mock_col}" AS VARCHAR)) AS v
+                FROM "{cat_table}"
+                WHERE "{mock_col}" IS NOT NULL
+                  AND TRIM(CAST("{mock_col}" AS VARCHAR)) != ''
+                ORDER BY 1
+                LIMIT 5000
+                """
+            ).fetchdf()
+            out = [str(x).strip() for x in (df["v"].tolist() if "v" in df.columns else []) if str(x).strip()]
+            return jsonify({"mock_ids": out})
+        finally:
+            try:
+                conn_c.close()
+            except Exception:
+                pass
+    except Exception as e:
+        return jsonify({"mock_ids": [], "error": str(e)})
+    finally:
+        try:
+            conn_l.close()
+        except Exception:
+            pass
+
+
+@app.route("/api/listings_with_sales/export")
+def api_listings_with_sales_export():
+    """
+    Export the same filtered Joined table rows as CSV.
+    Uses the same filters as /api/listings_with_sales but without pagination.
+    """
+    market = request.args.get("market", "").strip().lower()
+    search = request.args.get("search", "").strip()
+    _sis = request.args.get("search_in_source", "1").strip().lower()
+    search_in_source = _sis not in ("0", "false", "no", "off")
+    include_import = request.args.get("include_import", "0").strip().lower() in ("1", "true", "yes")
+    min_sold = request.args.get("min_sold", "").strip()
+    max_sold = request.args.get("max_sold", "").strip()
+    start_date = request.args.get("start_date", "").strip()
+    end_date = request.args.get("end_date", "").strip()
+    f_listing_source = request.args.get("source", "").strip()
+    mock_id = request.args.get("mock_id", "").strip()
+
+    # Safety default: exporting the fully unbounded join is too heavy.
+    if (
+        not min_sold
+        and not max_sold
+        and not search
+        and not f_listing_source
+        and not mock_id
+        and not market
+    ):
+        min_sold = "1"
+
+    all_flag = request.args.get("all", "0").strip().lower() in ("1", "true", "yes")
+    streaming = False
+    try:
+        per_page = int(request.args.get("per_page", 5000))
+    except Exception:
+        per_page = 5000
+    per_page = max(1, min(per_page, 5000))
+
+    conn_l = get_connection("active_listings")
+    conn_o = get_connection("orders")
+    conn_c = get_connection("catalogue")
+    if not conn_l:
+        return jsonify({"error": "active_listings.duckdb not found"}), 400
+    if not conn_o:
+        return jsonify({"error": "shipstation_orders.duckdb not found"}), 400
+
+    try:
+        if not loader.use_unified:
+            return jsonify({"error": "Export is only supported in unified mode for this build."}), 400
+
+        export_args = {
+            "market": market,
+            "search": search,
+            "min_sold": min_sold,
+            "max_sold": max_sold,
+            "start_date": start_date,
+            "end_date": end_date,
+            "source": f_listing_source,
+            "mock_id": mock_id,
+        }
+        filters = _parse_joined_filter_args(export_args)
+        base_query, params, use_order_cache = _build_joined_unified_base_query(conn_l, filters)
+        limit_sql = "" if all_flag else f"LIMIT {per_page}"
+        full_query = base_query + ' ORDER BY "Sold Qty" ASC, Title ASC' + (f" {limit_sql}" if limit_sql else "")
+
+        _duckdb_spill_for_joined(conn_l)
+        if use_order_cache:
+            _register_joined_order_cache(conn_l)
+        if all_flag:
+            # Stream CSV to avoid RAM blow-ups on 100k+ exports
+            streaming = True
+            cur = conn_l.execute(full_query, params)
+            cols = [d[0] for d in (cur.description or [])]
+
+            def _gen():
+                out = io.StringIO()
+                w = csv.writer(out)
+                try:
+                    w.writerow(cols)
+                    yield out.getvalue()
+                    out.seek(0); out.truncate(0)
+                    while True:
+                        rows = cur.fetchmany(1000)
+                        if not rows:
+                            break
+                        w.writerows(rows)
+                        yield out.getvalue()
+                        out.seek(0); out.truncate(0)
+                finally:
+                    # Close DB connections after streaming completes
+                    try:
+                        conn_l.close()
+                    except Exception:
+                        pass
+                    try:
+                        conn_o.close()
+                    except Exception:
+                        pass
+                    try:
+                        conn_c.close()
+                    except Exception:
+                        pass
+
+            return Response(
+                stream_with_context(_gen()),
+                mimetype="text/csv",
+                headers={"Content-disposition": "attachment; filename=listings_with_sales_export.csv"},
+            )
+        else:
+            df = conn_l.execute(full_query, params).fetchdf()
+            output = io.StringIO()
+            df.to_csv(output, index=False)
+            return Response(
+                output.getvalue(),
+                mimetype="text/csv",
+                headers={"Content-disposition": "attachment; filename=listings_with_sales_export.csv"},
+            )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        # If streaming, connections are closed in generator.
+        if not streaming:
+            try:
+                conn_l.close()
+            except Exception:
+                pass
+            try:
+                conn_o.close()
+            except Exception:
+                pass
+            try:
+                conn_c.close()
+            except Exception:
+                pass
 
 @app.route("/api/listings/listing_sources")
 def api_listings_listing_sources():
@@ -2939,10 +4780,39 @@ def api_explorer_tables():
     return jsonify({"tables": tables, "db": db_key})
 
 
+@app.route("/api/explorer/columns")
+def api_explorer_columns():
+    db_key = request.args.get("db", "products")
+    table = request.args.get("table", "")
+    if not table:
+        return jsonify({"columns": [], "error": "No table selected"})
+    # Enforce that table is selectable under this db (prevents "Products" showing listings tables)
+    allowed = {t.get("name") for t in get_tables(db_key)}
+    if allowed and table not in allowed:
+        return jsonify({"columns": [], "error": f"Table '{table}' is not part of '{db_key}' explorer scope"})
+    conn = get_connection(db_key)
+    if not conn:
+        return jsonify({"columns": [], "error": f"{db_key} database not found"})
+    try:
+        col_info = conn.execute(f'DESCRIBE "{table}"').fetchall()
+        cols = [str(c[0]) for c in col_info]
+        return jsonify({"columns": cols})
+    except Exception as e:
+        return jsonify({"columns": [], "error": str(e)})
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 @app.route("/api/explorer/query")
 def api_explorer_query():
     db_key = request.args.get("db", "products")
     table = request.args.get("table", "")
+    col_pick = request.args.get("column", "").strip()  # legacy single-column param
+    cols_pick_raw = request.args.get("columns", "").strip()
+    search = request.args.get("search", "").strip()
     page = int(request.args.get("page", 1))
     per_page = int(request.args.get("per_page", 50))
     offset = (page - 1) * per_page
@@ -2950,21 +4820,71 @@ def api_explorer_query():
     if not table:
         return jsonify({"data": [], "error": "No table selected"})
 
+    allowed = {t.get("name") for t in get_tables(db_key)}
+    if allowed and table not in allowed:
+        return jsonify({"data": [], "error": f"Table '{table}' is not part of '{db_key}' explorer scope"})
+
     conn = get_connection(db_key)
     if not conn:
         return jsonify({"data": [], "error": f"{db_key} database not found"})
     try:
-        col_info = conn.execute(f"DESCRIBE {table}").fetchall()
-        cols = [str(c[0]) for c in col_info]
-        data = conn.execute(f'SELECT * FROM "{table}" LIMIT {per_page} OFFSET {offset}').fetchdf()
+        col_info = conn.execute(f'DESCRIBE "{table}"').fetchall()
+        cols_all = [str(c[0]) for c in col_info]
+
+        cols_shown = cols_all
+        select_sql = f'SELECT * FROM "{table}"'
+        where_sql = ""
+        params: list[Any] = []
+        # Multi-select columns support (preferred)
+        cols_pick: list[str] = []
+        if cols_pick_raw:
+            for part in cols_pick_raw.split(","):
+                p = str(part).strip()
+                if p:
+                    cols_pick.append(p)
+
+        # Backward-compatible single column pick
+        if not cols_pick and col_pick:
+            cols_pick = [col_pick]
+
+        # Validate and apply
+        if cols_pick:
+            cols_valid = [c for c in cols_pick if c in cols_all]
+            if cols_valid:
+                cols_shown = cols_valid
+                cols_sql = ", ".join([f'"{c}"' for c in cols_valid])
+                select_sql = f'SELECT {cols_sql} FROM "{table}"'
+
+        # Server-side search across table (NOT just current page).
+        # If user selected columns, search within those columns only; otherwise search a capped set.
+        if search:
+            search_cols = cols_shown if (cols_shown and cols_shown != cols_all) else cols_all
+            # Cap to avoid massive OR on extremely wide tables
+            search_cols = search_cols[:10]
+            ors = []
+            for c in search_cols:
+                ors.append(f"CAST(\"{c}\" AS VARCHAR) ILIKE ?")
+                params.append(f"%{search}%")
+            if ors:
+                where_sql = " WHERE (" + " OR ".join(ors) + ")"
+
+        data = conn.execute(f"{select_sql}{where_sql} LIMIT {per_page} OFFSET {offset}", params).fetchdf()
         
         for col in data.columns:
             if data[col].dtype == "object":
                 data[col] = data[col].astype(str)
         
-        cnt_res = conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()
+        cnt_res = conn.execute(f'SELECT COUNT(*) FROM "{table}"{where_sql}', params).fetchone()
         total = int(cnt_res[0]) if cnt_res else 0
-        return jsonify({"data": data.to_dict(orient="records"), "total": total, "columns": cols})
+        selected_cols = [c for c in (cols_pick or []) if c in cols_all]
+        return jsonify({
+            "data": data.to_dict(orient="records"),
+            "total": total,
+            "columns": cols_shown,
+            "all_columns": cols_all,
+            "selected_column": col_pick if col_pick in cols_all else "",
+            "selected_columns": selected_cols,
+        })
     except Exception as e:
         return jsonify({"error": str(e), "data": []})
     finally:
@@ -3203,17 +5123,31 @@ def api_sku_intelligence():
 class AppApi:
     def download_csv(self, filename: str, url: str):
         try:
-            r = requests.get(url)
+            # Large exports (especially Joined view) can take several minutes.
+            # Keep connect timeout short, but allow long server processing time.
+            # Some exports can pause between streamed chunks; use a generous read timeout.
+            r = requests.get(url, stream=True, timeout=(10, 7200))
             if r.status_code == 200 and webview:
                 # Target the window explicitly
                 win = webview.active_window() or (webview.windows[0] if webview.windows else None)
                 if not win:
                     print("No active webview window found.")
-                    return False
+                    return "No active app window found for file save dialog."
                 
+                # Prefer a real Downloads folder on Windows
+                default_dir = os.path.expanduser("~/Downloads")
+                try:
+                    if os.name == "nt":
+                        up = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+                        cand = os.path.join(up, "Downloads")
+                        if os.path.isdir(cand):
+                            default_dir = cand
+                except Exception:
+                    pass
+
                 res = win.create_file_dialog(
                     webview.SAVE_DIALOG, 
-                    directory=os.path.expanduser("~/Downloads"), 
+                    directory=default_dir,
                     save_filename=filename
                 )
                 
@@ -3224,12 +5158,54 @@ class AppApi:
                     file_path = str(file_path)
                     if not file_path.lower().endswith('.csv'):
                         file_path += '.csv'
-                    with open(file_path, 'w', encoding='utf-8', newline='') as f:
-                        f.write(r.text)
-                    return True
+                    # Stream to disk to avoid OOM on large exports
+                    ctype = (r.headers.get("content-type") or "").lower()
+                    if "application/json" in ctype:
+                        # likely an error payload; keep small and visible in logs
+                        try:
+                            print(f"[download_csv] server returned JSON: {r.text[:4000]}")
+                        except Exception:
+                            pass
+                        # Return a short error to the UI
+                        msg = ""
+                        try:
+                            j = r.json()
+                            msg = str(j.get("error") or j.get("message") or "")[:500]
+                        except Exception:
+                            try:
+                                msg = str(r.text or "")[:500]
+                            except Exception:
+                                msg = ""
+                        return msg or "Export failed (server returned JSON error)."
+                    try:
+                        with open(file_path, 'wb') as f:
+                            for chunk in r.iter_content(chunk_size=1024 * 256):
+                                if not chunk:
+                                    continue
+                                f.write(chunk)
+                        return ""  # empty string = success
+                    except PermissionError:
+                        # Most common on Windows: saving to protected folder or file is open/locked
+                        return "[Errno 13] Permission denied. Please choose a different folder/name, and make sure the CSV is not already open in Excel."
+                    except OSError as oe:
+                        return f"File write failed: {oe}"
+            # Non-200: try to capture a helpful message
+            if r is not None and r.status_code != 200:
+                msg = f"HTTP {r.status_code}"
+                try:
+                    ctype = (r.headers.get("content-type") or "").lower()
+                    if "application/json" in ctype:
+                        j = r.json()
+                        msg = str(j.get("error") or j.get("message") or msg)[:800]
+                    else:
+                        msg = str(r.text or msg)[:800]
+                except Exception:
+                    pass
+                return msg
         except Exception as e:
             print(f"Export Error: {e}")
-        return False
+            return str(e)
+        return "Export failed."
 
 if __name__ == "__main__":
     # Default behavior: launch as Desktop App if pywebview is installed.
@@ -3237,9 +5213,28 @@ if __name__ == "__main__":
     force_web = "--web" in sys.argv
     force_desktop = "--desktop" in sys.argv
 
+    def _pick_port(preferred: int = 5000) -> int:
+        """Pick a free localhost port, preferring `preferred` if available."""
+        # Try preferred first
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind(("127.0.0.1", preferred))
+            s.close()
+            return preferred
+        except Exception:
+            pass
+        # Fallback: let OS choose a free port
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        port = int(s.getsockname()[1])
+        s.close()
+        return port
+
     if (force_desktop or not force_web) and webview:
+        port = _pick_port(5000)
+
         def run_flask():
-            app.run(port=5000, debug=False, use_reloader=False)
+            app.run(port=port, debug=False, use_reloader=False)
 
         t = threading.Thread(target=run_flask)
         t.daemon = True
@@ -3249,7 +5244,7 @@ if __name__ == "__main__":
         api = AppApi()
         webview.create_window(
             "eCommerce Operations Dashboard",
-            "http://localhost:5000",
+            f"http://127.0.0.1:{port}",
             js_api=api,
             width=1280,
             height=840,
@@ -3258,9 +5253,10 @@ if __name__ == "__main__":
         )
         webview.start()
     else:
+        port = _pick_port(5000)
         print("\n" + "="*55)
         print("  eCommerce Dashboard Starting...")
         print("="*55)
-        print("  Url: http://localhost:5000")
+        print(f"  Url: http://127.0.0.1:{port}")
         print("="*55 + "\n")
-        app.run(debug=True, port=5000)
+        app.run(debug=True, port=port)

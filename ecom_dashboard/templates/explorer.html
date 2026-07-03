@@ -15,9 +15,46 @@
   </div>
   <div>
     <label style="font-size:12px;font-weight:600;color:#6a8aaa;display:block;margin-bottom:6px">SELECT TABLE</label>
-    <select id="tableSelect" onchange="loadTableData(1)" style="padding:9px 14px;border:1px solid #dde3ed;border-radius:8px;font-size:13.5px;background:#fff;min-width:220px">
+    <select id="tableSelect" onchange="onTableChange()" style="padding:9px 14px;border:1px solid #dde3ed;border-radius:8px;font-size:13.5px;background:#fff;min-width:220px">
       <option>— Select a table —</option>
     </select>
+  </div>
+  <div style="min-width:260px; flex: 1 1 260px;">
+    <label style="font-size:12px;font-weight:600;color:#6a8aaa;display:block;margin-bottom:6px">SEARCH (TABLE)</label>
+    <input id="searchInput" type="text" placeholder="e.g. Item Number / SKU / keyword…" onkeydown="if(event.key==='Enter')loadTableData(1)"
+      style="width:100%; padding:9px 14px;border:1px solid #dde3ed;border-radius:8px;font-size:13.5px;background:#fff;">
+  </div>
+  <div>
+    <label style="font-size:12px;font-weight:600;color:#6a8aaa;display:block;margin-bottom:6px">SELECT COLUMN</label>
+    <!-- Quick-pick dropdown (checkbox list) -->
+    <div id="columnQuickPick" style="position:relative; min-width:260px; max-width:360px;">
+      <button id="columnQuickPickBtn" class="btn btn-sm btn-outline" type="button"
+        onclick="toggleColumnQuickPick()"
+        style="width:100%; display:flex; justify-content:space-between; align-items:center; padding:9px 12px; border-radius:8px;"
+        disabled>
+        <span id="columnQuickPickLabel">0 selected</span>
+        <span style="opacity:.65">▾</span>
+      </button>
+      <div id="columnQuickPickPanel"
+        style="display:none; position:absolute; left:0; right:0; top:42px; z-index:500; background:#fff; border:1px solid #dde3ed; border-radius:10px; box-shadow:0 10px 30px rgba(0,0,0,.12); padding:10px;">
+        <input id="columnQuickPickSearch" type="text" placeholder="Search columns…"
+          oninput="filterColumnQuickPickList()"
+          style="width:100%; margin-bottom:10px; padding:9px 12px; border:1px solid #dde3ed; border-radius:8px; font-size:13px;">
+        <label style="display:flex; align-items:center; gap:8px; padding:6px 4px; font-size:12.5px; color:#284b63; font-weight:700;">
+          <input id="columnQuickPickAll" type="checkbox" onchange="onColumnQuickPickAllChange()">
+          All Columns
+        </label>
+        <div id="columnQuickPickList" style="max-height:260px; overflow:auto; padding:6px 4px; border-top:1px solid #eef2f7; margin-top:6px;"></div>
+      </div>
+    </div>
+
+    <!-- Hidden native multi-select kept for data + keyboard fallback -->
+    <select id="columnSelect" multiple onchange="onColumnChange()" style="display:none" disabled>
+      <option value="">All Columns (default)</option>
+    </select>
+  </div>
+  <div style="align-self:flex-end">
+    <button class="btn" onclick="loadTableData(1)" title="Load rows for selected table/column">Load Data</button>
   </div>
   <div style="align-self:flex-end">
     <span id="rowCount" style="font-size:13px;color:#8a9ab0"></span>
@@ -40,50 +77,239 @@
 {% block scripts %}
 <script>
 let currentPage=1,totalRows=0,perPage=50;
+let explorerHasData = false;
 
 async function loadTables(){
   const db=document.getElementById('dbSelect').value;
   const r=await fetch(`/api/explorer/tables?db=${db}`);
   const d=await r.json();
   const sel=document.getElementById('tableSelect');
+  const colSel=document.getElementById('columnSelect');
+  const qpBtn=document.getElementById('columnQuickPickBtn');
   sel.innerHTML='<option>— Select a table —</option>';
+  if (colSel) { colSel.innerHTML='<option value="">All Columns (default)</option>'; colSel.disabled = true; }
+  if (qpBtn) { qpBtn.disabled = true; }
+  resetColumnQuickPick();
   if(d.tables&&d.tables.length){
     d.tables.forEach(t=>{
       sel.innerHTML+=`<option value="${t.name}">${t.name} (${fmt(t.row_count)} rows)</option>`;
     });
     // Auto select first
     sel.selectedIndex=1;
-    loadTableData(1);
+    onTableChange();
   }
 }
+
+function onTableChange(){
+  const colSel=document.getElementById('columnSelect');
+  const qpBtn=document.getElementById('columnQuickPickBtn');
+  if (colSel) { colSel.innerHTML='<option value="">All Columns (default)</option>'; colSel.disabled = true; }
+  if (qpBtn) { qpBtn.disabled = true; }
+  resetColumnQuickPick();
+  explorerHasData = false;
+  document.getElementById('explorerTable').innerHTML='<div class="loading">Select a column (optional) then click <b>Load Data</b>.</div>';
+  document.getElementById('pagination').innerHTML='';
+  // Load columns for this table first (so dropdown always shows ALL columns)
+  (async () => {
+    try {
+      const db=document.getElementById('dbSelect').value;
+      const table=document.getElementById('tableSelect').value;
+      if(!table||table.startsWith('—')) return;
+      const r=await fetch(`/api/explorer/columns?db=${db}&table=${encodeURIComponent(table)}`);
+      const d=await r.json();
+      if (d && d.columns && d.columns.length && colSel) {
+        colSel.innerHTML = '<option value="">All Columns (default)</option>';
+        d.columns.forEach(c => {
+          const o=document.createElement('option');
+          o.value=c; o.textContent=c;
+          colSel.appendChild(o);
+        });
+        colSel.disabled = false;
+        if (qpBtn) { qpBtn.disabled = false; }
+        initColumnQuickPick(d.columns || []);
+        // Show column chips immediately (no data query needed)
+        document.getElementById('columnInfo').innerHTML=
+          '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:4px">'
+          +d.columns.map(c=>`<span style="background:#e3f0ff;color:#1565c0;border-radius:12px;padding:2px 10px;font-size:11px;font-weight:600">${c}</span>`).join('')
+          +'</div>';
+        document.getElementById('tableTitle').textContent=`${db} → ${table}`;
+        document.getElementById('tableInfo').textContent=`${d.columns.length} columns (click Load Data to fetch rows)`;
+      }
+    } catch (e) { /* ignore */ }
+  })();
+}
+
+function onColumnChange(){
+  // Only reload rows if data is already loaded (avoid heavy queries on dropdown change).
+  if (explorerHasData) loadTableData(1);
+}
+
+// ── Column Quick Pick (checkbox dropdown) ───────────────────────────────────────
+function resetColumnQuickPick(){
+  const panel = document.getElementById('columnQuickPickPanel');
+  const list = document.getElementById('columnQuickPickList');
+  const search = document.getElementById('columnQuickPickSearch');
+  const all = document.getElementById('columnQuickPickAll');
+  const label = document.getElementById('columnQuickPickLabel');
+  if (panel) panel.style.display = 'none';
+  if (list) list.innerHTML = '';
+  if (search) search.value = '';
+  if (all) all.checked = false;
+  if (label) label.textContent = '0 selected';
+}
+
+function toggleColumnQuickPick(forceOpen = null){
+  const panel = document.getElementById('columnQuickPickPanel');
+  const btn = document.getElementById('columnQuickPickBtn');
+  if (!panel || !btn || btn.disabled) return;
+  const wantOpen = (forceOpen === null) ? (panel.style.display === 'none') : !!forceOpen;
+  panel.style.display = wantOpen ? 'block' : 'none';
+  if (wantOpen) {
+    const inp = document.getElementById('columnQuickPickSearch');
+    if (inp) setTimeout(() => inp.focus(), 0);
+  }
+}
+
+function initColumnQuickPick(columns){
+  const list = document.getElementById('columnQuickPickList');
+  if (!list) return;
+  list.innerHTML = '';
+  const sel = document.getElementById('columnSelect');
+  const selected = new Set([...(sel ? sel.selectedOptions : [])].map(o => String(o.value || '')).filter(Boolean));
+  columns.forEach((c) => {
+    const id = 'colqp_' + btoa(unescape(encodeURIComponent(String(c)))).replace(/=/g,'');
+    const row = document.createElement('label');
+    row.setAttribute('data-col', String(c));
+    row.style.cssText = 'display:flex; align-items:center; gap:8px; padding:6px 4px; font-size:12.5px; color:#1e2a3a;';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = selected.has(String(c));
+    cb.addEventListener('change', () => onColumnQuickPickItemChange());
+    const sp = document.createElement('span');
+    sp.textContent = String(c);
+    sp.style.cssText = 'white-space:nowrap; overflow:hidden; text-overflow:ellipsis;';
+    row.appendChild(cb);
+    row.appendChild(sp);
+    list.appendChild(row);
+  });
+  // sync label + all checkbox
+  syncColumnQuickPickFromList();
+}
+
+function filterColumnQuickPickList(){
+  const q = String((document.getElementById('columnQuickPickSearch')||{}).value || '').trim().toLowerCase();
+  const list = document.getElementById('columnQuickPickList');
+  if (!list) return;
+  [...list.querySelectorAll('label[data-col]')].forEach(row => {
+    const col = String(row.getAttribute('data-col') || '').toLowerCase();
+    row.style.display = (!q || col.includes(q)) ? 'flex' : 'none';
+  });
+}
+
+function onColumnQuickPickAllChange(){
+  const all = document.getElementById('columnQuickPickAll');
+  const list = document.getElementById('columnQuickPickList');
+  if (!all || !list) return;
+  const want = !!all.checked;
+  [...list.querySelectorAll('input[type="checkbox"]')].forEach(cb => { cb.checked = want; });
+  onColumnQuickPickItemChange();
+}
+
+function onColumnQuickPickItemChange(){
+  // Update hidden select selections to keep existing loadTableData logic
+  const list = document.getElementById('columnQuickPickList');
+  const sel = document.getElementById('columnSelect');
+  if (!list || !sel) return;
+  const picks = [...list.querySelectorAll('label[data-col]')].filter(r => {
+    const cb = r.querySelector('input[type="checkbox"]');
+    return cb && cb.checked;
+  }).map(r => String(r.getAttribute('data-col') || '')).filter(Boolean);
+
+  const pickSet = new Set(picks);
+  [...sel.options].forEach(o => {
+    if (!o.value) { o.selected = false; return; } // ignore All Columns option
+    o.selected = pickSet.has(String(o.value));
+  });
+  syncColumnQuickPickFromList();
+  onColumnChange();
+}
+
+function syncColumnQuickPickFromList(){
+  const list = document.getElementById('columnQuickPickList');
+  const label = document.getElementById('columnQuickPickLabel');
+  const all = document.getElementById('columnQuickPickAll');
+  if (!list) return;
+  const items = [...list.querySelectorAll('label[data-col]')];
+  const checked = items.filter(r => {
+    const cb = r.querySelector('input[type="checkbox"]');
+    return cb && cb.checked;
+  }).length;
+  if (label) label.textContent = `${checked} selected`;
+  if (all) all.checked = (items.length > 0 && checked === items.length);
+}
+
+// Close quick-pick on outside click
+document.addEventListener('click', (e) => {
+  const panel = document.getElementById('columnQuickPickPanel');
+  const wrap = document.getElementById('columnQuickPick');
+  if (!panel || !wrap) return;
+  if (panel.style.display !== 'block') return;
+  if (!wrap.contains(e.target)) toggleColumnQuickPick(false);
+});
 
 async function loadTableData(page){
   currentPage=page;
   const db=document.getElementById('dbSelect').value;
   const table=document.getElementById('tableSelect').value;
+  const search=(document.getElementById('searchInput')||{}).value||'';
+  const colSel=document.getElementById('columnSelect');
+  const colPicks = (colSel && !colSel.disabled)
+    ? [...colSel.selectedOptions].map(o => String(o.value || '').trim()).filter(v => v !== '')
+    : [];
   if(!table||table.startsWith('—')) return;
 
   document.getElementById('explorerTable').innerHTML='<div class="loading">Loading data...</div>';
   document.getElementById('tableTitle').textContent=`${db} → ${table}`;
 
-  const r=await fetch(`/api/explorer/query?db=${db}&table=${encodeURIComponent(table)}&page=${page}&per_page=${perPage}`);
+  const q = new URLSearchParams({
+    db: db,
+    table: table,
+    page: String(page),
+    per_page: String(perPage),
+  });
+  if (search.trim()) q.set('search', search.trim());
+  if (colPicks.length) q.set('columns', colPicks.join(','));
+  const r=await fetch(`/api/explorer/query?${q.toString()}`);
   const d=await r.json();
 
   if(d.error){document.getElementById('explorerTable').innerHTML=`<div class="error-msg">${d.error}</div>`;return;}
 
+  explorerHasData = true;
   totalRows=d.total||0;
-  document.getElementById('tableInfo').textContent=`${fmt(totalRows)} total rows · ${(d.columns||[]).length} columns`;
+  const allCols = d.all_columns || d.columns || [];
+  document.getElementById('tableInfo').textContent=`${fmt(totalRows)} total rows · ${allCols.length} columns`;
   document.getElementById('rowCount').textContent=`${fmt(totalRows)} rows`;
 
-  // Show column chips
-  if(d.columns){
-    document.getElementById('columnInfo').innerHTML=
-      '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:4px">'
-      +d.columns.map(c=>`<span style="background:#e3f0ff;color:#1565c0;border-radius:12px;padding:2px 10px;font-size:11px;font-weight:600">${c}</span>`).join('')
-      +'</div>';
+  // Keep current selections if still valid (only on first page load)
+  if (page === 1 && colSel) {
+    const picks = (d.selected_columns && Array.isArray(d.selected_columns)) ? d.selected_columns : [];
+    if (picks && picks.length) {
+      const set = new Set(picks.map(String));
+      [...colSel.options].forEach(o => { o.selected = (o.value === '') ? false : set.has(String(o.value)); });
+    }
   }
 
-  renderTable('explorerTable',d.data,d.columns);
+  // Column chips as reference (all columns)
+  if(allCols && allCols.length){
+    document.getElementById('columnInfo').innerHTML=
+      '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:4px">'
+      +allCols.map(c=>`<span style="background:#e3f0ff;color:#1565c0;border-radius:12px;padding:2px 10px;font-size:11px;font-weight:600">${c}</span>`).join('')
+      +'</div>';
+  } else {
+    document.getElementById('columnInfo').innerHTML='';
+  }
+
+  renderTable('explorerTable',d.data,d.columns||[]);
 
   // Pagination
   const total=Math.ceil(totalRows/perPage);

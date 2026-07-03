@@ -24,6 +24,31 @@
       overflow-x: hidden
     }
 
+    /* ── SCROLLBARS ── */
+    html {
+      scrollbar-width: thin;                 /* Firefox */
+      scrollbar-color: #cbd5e1 transparent;  /* thumb, track */
+    }
+    /* Chromium/WebView (pywebview) */
+    ::-webkit-scrollbar {
+      width: 10px;
+      height: 10px;
+    }
+    ::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    ::-webkit-scrollbar-thumb {
+      background: #cbd5e1;
+      border-radius: 10px;
+      border: 2px solid transparent;
+      background-clip: content-box;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background: #94a3b8;
+      border: 2px solid transparent;
+      background-clip: content-box;
+    }
+
     /* ── SIDEBAR ── */
     .sidebar {
       width: 240px;
@@ -227,7 +252,12 @@
       display: flex;
       align-items: center;
       justify-content: space-between;
-      border-bottom: 1px solid #f0f2f7
+      border-bottom: 1px solid #f0f2f7;
+      background: #fff;
+      /* Keep card heading visible while page scrolls */
+      position: sticky;
+      top: 0;
+      z-index: 6
     }
 
     .table-header h3 {
@@ -237,12 +267,18 @@
     }
 
     .table-wrap {
-      overflow-x: auto
+      overflow: auto;
+      /* Keep scrolling inside the table instead of the whole page */
+      max-height: 62vh;
+      overscroll-behavior: contain;
+      -webkit-overflow-scrolling: touch
     }
 
     table {
       width: 100%;
-      border-collapse: collapse;
+      /* Sticky headers behave better with separate borders */
+      border-collapse: separate;
+      border-spacing: 0;
       font-size: 13.5px
     }
 
@@ -256,7 +292,11 @@
       padding: 12px 18px;
       text-align: left;
       white-space: nowrap;
-      border-bottom: 1px solid #e9eef5
+      border-bottom: 1px solid #e9eef5;
+      /* Sticky table headers (works inside .table-wrap scrolling container) */
+      position: sticky;
+      top: 0;
+      z-index: 3
     }
 
     td {
@@ -687,9 +727,21 @@
       const im = document.getElementById('imgModalImg');
       const a = document.getElementById('imgModalLink');
       if (!m || !im || !a) return;
-      im.src = url;
-      a.href = url;
+      const orig = String(url || '');
+      im.src = toImageProxyUrl(orig);
+      a.href = orig;
       m.style.display = 'flex';
+    }
+
+    function toImageProxyUrl(url) {
+      const u = String(url || '').trim();
+      if (!u) return '';
+      if (u.startsWith('/api/image_proxy?')) return u;
+      // Only proxy remote URLs; keep local relative paths intact.
+      if (/^https?:\/\//i.test(u) || /^www\./i.test(u)) {
+        return '/api/image_proxy?url=' + encodeURIComponent(u);
+      }
+      return u;
     }
 
     /** Delegate clicks for thumbnails using data-fullsrc (no fragile inline onclick escaping). */
@@ -749,12 +801,28 @@
         }
       }
 
+      const isExplorer = containerId === 'explorerTable';
       let html = `<div class="table-wrap"><table><thead><tr>`;
       cols.forEach((c, i) => {
         const cls = ((hasFocus && colHasMatch[i]) || forceCol[i]) ? ' class="col-hit"' : '';
         html += `<th${cls} title="${c}">${c}</th>`;
       });
-      html += `</tr></thead><tbody>`;
+      html += `</tr>`;
+
+      // DB Explorer: add per-column filter inputs (client-side, current page only)
+      if (isExplorer) {
+        html += `<tr class="col-filter-row">`;
+        cols.forEach((c) => {
+          const esc = String(c || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/\"/g,'&quot;');
+          html += `<th style="padding:8px 10px; background:#fff;">
+            <input data-col="${esc}" class="col-filter-input" placeholder="Filter…" 
+              style="width:100%; padding:6px 8px; border-radius:8px; border:1px solid #dbe4ee; font-size:12px; outline:none;">
+          </th>`;
+        });
+        html += `</tr>`;
+      }
+
+      html += `</thead><tbody>`;
       
       data.forEach(row => {
         html += `<tr>`;
@@ -766,9 +834,11 @@
           if (String(c).toLowerCase() === 'image') {
             const url = String(rawVal || '').trim();
             if (url) {
-              const esc = url.replace(/&/g, '&amp;').replace(/\"/g, '&quot;').replace(/</g, '&lt;');
+              const prox = toImageProxyUrl(url);
+              const esc = prox.replace(/&/g, '&amp;').replace(/\"/g, '&quot;').replace(/</g, '&lt;');
+              const fullEsc = url.replace(/&/g, '&amp;').replace(/\"/g, '&quot;').replace(/</g, '&lt;');
               const cls = ((hasFocus && colHasMatch[i]) || forceCol[i]) ? ' class="col-hit"' : '';
-              html += `<td${cls} title="Click to view"><img class="thumb-zoom" data-fullsrc="${esc}" src="${esc}" alt="design" loading="lazy" referrerpolicy="no-referrer" style="height:34px; width:34px; object-fit:cover; border-radius:6px; border:1px solid #e0e6ef; cursor:pointer"></td>`;
+              html += `<td${cls} title="Click to view"><img class="thumb-zoom" data-fullsrc="${fullEsc}" src="${esc}" alt="design" loading="lazy" referrerpolicy="no-referrer" style="height:34px; width:34px; object-fit:cover; border-radius:6px; border:1px solid #e0e6ef; cursor:pointer"></td>`;
               return;
             }
             {
@@ -792,6 +862,35 @@
       delete container.dataset.thumbBound;
       container.innerHTML = html;
       bindThumbClicks(container);
+
+      if (isExplorer) {
+        // Filter visible rows only (no server calls)
+        const wrap = container.querySelector('.table-wrap');
+        const inputs = [...container.querySelectorAll('.col-filter-input')];
+        const tbody = container.querySelector('tbody');
+        if (wrap && inputs.length && tbody) {
+          const apply = () => {
+            const filters = inputs
+              .map((inp, idx) => ({ idx, q: String(inp.value || '').trim().toLowerCase() }))
+              .filter(f => !!f.q);
+            const rows = [...tbody.querySelectorAll('tr')];
+            if (!filters.length) {
+              rows.forEach(r => { r.style.display = ''; });
+              return;
+            }
+            rows.forEach(r => {
+              const tds = [...r.querySelectorAll('td')];
+              const ok = filters.every(f => {
+                const cell = tds[f.idx];
+                const txt = cell ? String(cell.textContent || '').toLowerCase() : '';
+                return txt.includes(f.q);
+              });
+              r.style.display = ok ? '' : 'none';
+            });
+          };
+          inputs.forEach(inp => inp.addEventListener('input', apply));
+        }
+      }
     }
   </script>
   {% block scripts %}{% endblock %}

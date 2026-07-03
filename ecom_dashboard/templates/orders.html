@@ -66,6 +66,16 @@
     box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.18) !important;
     background: rgba(34, 197, 94, 0.06) !important;
   }
+
+  .info-msg {
+    background: #eef6ff;
+    border: 1px solid #b6dbff;
+    color: #0b3a66;
+    padding: 14px 16px;
+    border-radius: 10px;
+    font-size: 13px;
+    line-height: 1.35;
+  }
 </style>
 
 <div class="chart-grid" id="chartArea" style="display:none">
@@ -87,15 +97,15 @@
 <div class="filter-box">
   <div class="filter-group">
     <label>🔍 SEARCH SKU / NAME</label>
-    <input type="text" id="searchInput" placeholder="Search orders..." onkeydown="if(event.key==='Enter')loadAll()">
+    <input type="text" id="searchInput" placeholder="Search orders..." onkeydown="if(event.key==='Enter'){ if(ordersPageMode==='joined'){ applyFilters(); } else { loadAll(); } }">
   </div>
   <div class="filter-group">
     <label>📅 START DATE</label>
-    <input type="date" id="startDate" onchange="loadAll()">
+    <input type="date" id="startDate" onchange="markFiltersDirty()">
   </div>
   <div class="filter-group">
     <label>📅 END DATE</label>
-    <input type="date" id="endDate" onchange="loadAll()">
+    <input type="date" id="endDate" onchange="markFiltersDirty()">
   </div>
   <div class="filter-group">
     <label>⚡ PRESETS</label>
@@ -116,7 +126,7 @@
   </div>
   <div class="filter-group" id="joinedListingMarketGroup" style="display:none;">
     <label>🛒 LISTING CHANNEL</label>
-    <select id="filterJoinedListing" onchange="loadAll()">
+    <select id="filterJoinedListing" onchange="markFiltersDirty()">
       <option value="">All channels</option>
       <option value="ebay">eBay</option>
       <option value="amazon">Amazon</option>
@@ -126,7 +136,7 @@
   </div>
   <div class="filter-group">
     <label id="labelFilterMarket">🌍 MARKET</label>
-    <select id="filterMarket" onchange="loadAll()">
+    <select id="filterMarket" onchange="markFiltersDirty()">
       <option value="">All Markets</option>
       <option value="UK">UK</option>
       <option value="US">US / Other</option>
@@ -134,24 +144,46 @@
   </div>
   <div class="filter-group">
     <label id="labelFilterQty">📦 MIN QTY</label>
-    <input type="number" id="filterQty" placeholder="Min Qty" onkeydown="if(event.key==='Enter')loadAll()">
+    <input type="number" id="filterQty" placeholder="Min Qty" onkeydown="if(event.key==='Enter'){ if(ordersPageMode==='joined'){ applyFilters(); } else { loadAll(); } }">
   </div>
   <div class="filter-group" id="joinedSoldFilterGroup" style="display:none;">
     <label>📉 SOLD FILTER (≥) — type 6 for “6+”</label>
-    <input type="number" id="joinedSoldFilter" min="0" step="1" placeholder="1" onchange="loadAll()"
-      onkeydown="if(event.key==='Enter')loadAll()">
+    <input type="number" id="joinedSoldFilter" min="0" step="1" value="1" placeholder="1" onchange="markFiltersDirty()"
+      title="Default 1+ sold keeps the joined query fast; clear for all sold counts."
+      onkeydown="if(event.key==='Enter'){ applyFilters(); }">
+  </div>
+  <div class="filter-group" id="joinedMockIdFilterGroup" style="display:none;">
+    <label>🆔 MOCK ID</label>
+    <select id="joinedMockIdFilter" onchange="markFiltersDirty()" style="width:100%; padding:8px; border-radius:6px; border:1px solid #ddd;">
+      <option value="">All Mock IDs</option>
+    </select>
   </div>
   <div class="filter-group">
     <label>🧠 VIEW MODE</label>
-    <select id="analysisView" onchange="loadAll()">
+    <select id="analysisView" onchange="markFiltersDirty()">
       <option value="1" selected>Analysis View (Recommended)</option>
       <option value="0">Raw View (All Columns)</option>
     </select>
   </div>
-  <div style="display:flex; gap:10px">
-    <button id="filterBtn" class="btn" style="flex:1" onclick="loadAll()">Filter</button>
-    <button id="exportBtn" class="btn btn-success" style="flex:1" onclick="exportCSV()" title="Export filtered results to CSV">💾
+  <div style="display:flex; gap:10px; flex-wrap:wrap; grid-column:1 / -1;">
+    <button id="filterBtn" class="btn" style="flex:1 1 160px" onclick="applyFilters()">Filter</button>
+    <button id="exportBtn" class="btn btn-success" style="flex:1 1 160px" onclick="exportCSV()" title="Export filtered results to CSV">💾
       Export</button>
+    <button id="exportAllBtn" class="btn btn-success" style="flex:1 1 160px; background:#10b981; border-color:#10b981" onclick="exportAllWithProgress()" title="Background export with progress">📥 Export All</button>
+    <button id="exportAllCancelBtn" class="btn" style="flex:0 0 auto; display:none; border:1px solid #ef4444; color:#ef4444; background:#fff;" onclick="cancelExportAll()" title="Cancel background export">Cancel</button>
+  </div>
+  <div id="exportAllStatus" style="margin-top:8px; font-size:12px; color:#6b7280; display:none; grid-column:1 / -1;"></div>
+  <div id="exportAllBarWrap" style="margin-top:6px; height:6px; border-radius:3px; background:#e5e7eb; overflow:hidden; display:none; grid-column:1 / -1;">
+    <div id="exportAllBarFill" style="height:100%; width:0%; background:#10b981; border-radius:3px; transition: width 0.4s ease;"></div>
+  </div>
+  <div style="margin-top:10px; display:flex; align-items:center; gap:10px; flex-wrap:wrap; grid-column:1 / -1;">
+    <label style="display:flex; align-items:center; gap:8px; font-size:12px; color:#6a8aaa; font-weight:700;">
+      <input type="checkbox" id="exportAllToggle" checked>
+      Export all rows (unlimited)
+    </label>
+    <span style="font-size:12px; color:#8a9ab0;">
+      If laptop slows, untick to export first <b>5,000</b> rows only.
+    </span>
   </div>
   <div id="filterStatus" style="margin-top:8px; font-size:12px; color:#8a9ab0; display:none;"></div>
 </div>
@@ -213,7 +245,9 @@
 {% block scripts %}
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <script>
-  let currentPage = 1, totalRows = 0, perPage = 50;
+  // Higher perPage so users can scroll inside the table box.
+  // Keep it capped to avoid freezing weaker laptops.
+  let currentPage = 1, totalRows = 0, perPage = 200;
   let timelineChart = null;
   let nicheChart = null;
   let ordersPageMode = 'orders';
@@ -223,6 +257,174 @@
   let ordersAbort = null;
   let summaryAbort = null;
   let joinedAbort = null;
+  let joinedManualRun = false;
+  let ordersManualRun = true; // allow first load; later require Filter click
+  let infiniteLoading = false;
+  let infiniteEnabled = true;
+  let loadedPages = 0;
+  let lastQueryKey = '';
+  let lastColumns = [];
+
+  function markFiltersDirty() {
+    // Reduce laptop hangs: don't auto-run heavy queries on every control change.
+    if (ordersPageMode === 'joined') joinedManualRun = false;
+    else ordersManualRun = false;
+    setFilteringUI(false, 'Ready');
+    const box = document.getElementById('ordersTable');
+    if (box) box.innerHTML = '<div class="info-msg">Filters changed. Click <b>Filter</b> to apply.</div>';
+    const pag = document.getElementById('pagination');
+    if (pag) pag.innerHTML = '';
+  }
+
+  function _getQueryKey() {
+    const isJoined = ordersPageMode === 'joined';
+    const listingEl = document.getElementById('filterJoinedListing');
+    const listingChannel = listingEl && listingEl.multiple
+      ? ([...listingEl.selectedOptions].map(o => (o.value || '').trim()).filter(Boolean).join(','))
+      : ((listingEl || {}).value || '');
+    const mockEl = document.getElementById('joinedMockIdFilter');
+    const mockId = mockEl && mockEl.multiple
+      ? ([...mockEl.selectedOptions].map(o => (o.value || '').trim()).filter(Boolean).join(','))
+      : ((mockEl || {}).value || '');
+    const base = [
+      isJoined ? 'joined' : 'orders',
+      (document.getElementById('searchInput') || {}).value || '',
+      (document.getElementById('startDate') || {}).value || '',
+      (document.getElementById('endDate') || {}).value || '',
+      getSourceFilterValue() || '',
+      listingChannel,
+      ((document.getElementById('joinedSoldFilter') || {}).value || ''),
+      ((document.getElementById('filterQty') || {}).value || ''),
+      mockId,
+      ((document.getElementById('filterMarket') || {}).value || ''),
+    ];
+    return base.map(x => String(x)).join('|');
+  }
+
+  function resetInfiniteState() {
+    infiniteLoading = false;
+    loadedPages = 0;
+    lastColumns = [];
+    lastQueryKey = _getQueryKey();
+  }
+
+  function _bindInfiniteScroll() {
+    if (!infiniteEnabled) return;
+    const container = document.getElementById('ordersTable');
+    if (!container) return;
+    const wrap = container.querySelector('.table-wrap');
+    if (!wrap) return;
+    if (wrap.dataset.infBound === '1') return;
+    wrap.dataset.infBound = '1';
+    wrap.addEventListener('scroll', () => {
+      if (infiniteLoading) return;
+      if (!totalRows || !loadedPages) return;
+      const nearBottom = (wrap.scrollTop + wrap.clientHeight) >= (wrap.scrollHeight - 240);
+      if (!nearBottom) return;
+      const shown = loadedPages * perPage;
+      if (shown >= totalRows) return;
+      infiniteLoading = true;
+      const next = loadedPages + 1;
+      if (ordersPageMode === 'joined') {
+        loadListingsWithSalesFromOrders(next, true).finally(() => { infiniteLoading = false; });
+      } else {
+        loadOrders(next, true).finally(() => { infiniteLoading = false; });
+      }
+    }, { passive: true });
+  }
+
+  function _escapeHtml(s) {
+    return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+  }
+
+  function appendRowsToExistingTable(containerId, data, columns, highlightTerm = '') {
+    const container = document.getElementById(containerId);
+    if (!container) return false;
+    const tbody = container.querySelector('table tbody');
+    if (!tbody) return false;
+    const cols = columns || [];
+    const term = String(highlightTerm || '');
+    for (const row of (data || [])) {
+      const tr = document.createElement('tr');
+      for (const c of cols) {
+        let rawVal = row[c];
+        let val = (rawVal === null || rawVal === undefined || rawVal === '') ? '—' : String(rawVal);
+        let displayVal = (typeof truncate === 'function') ? truncate(val, 120) : val;
+        // Keep highlight if helpers exist
+        if (term && typeof applyHighlights === 'function' && displayVal !== '—') {
+          displayVal = applyHighlights(displayVal, term);
+        } else {
+          displayVal = _escapeHtml(displayVal);
+        }
+        const td = document.createElement('td');
+        td.innerHTML = displayVal;
+        td.title = val;
+        tr.appendChild(td);
+      }
+      tbody.appendChild(tr);
+    }
+    return true;
+  }
+
+  function _getAllOpt(selectEl) {
+    if (!selectEl) return null;
+    return [...selectEl.options].find(o => String(o.value || '') === '') || null;
+  }
+
+  function _setAllRealSelected(selectEl, on) {
+    if (!selectEl) return;
+    const allOpt = _getAllOpt(selectEl);
+    [...selectEl.options].forEach(o => {
+      const isAll = String(o.value || '') === '';
+      o.selected = isAll ? !!on : !!on;
+    });
+    // Ensure the "All" option reflects the state
+    if (allOpt) allOpt.selected = !!on;
+  }
+
+  function _syncAllCheckbox(selectEl) {
+    if (!selectEl || !selectEl.multiple) return;
+    const allOpt = _getAllOpt(selectEl);
+    if (!allOpt) return;
+    const real = [...selectEl.options].filter(o => String(o.value || '') !== '');
+    const allSelected = real.length > 0 && real.every(o => o.selected);
+    allOpt.selected = !!allSelected;
+  }
+
+  function attachSelectAll(selectEl) {
+    if (!selectEl) return;
+    // Track previous "All" state so we can detect uncheck.
+    const markPrev = () => {
+      const a = _getAllOpt(selectEl);
+      selectEl.dataset.prevAll = (a && a.selected) ? '1' : '0';
+    };
+    selectEl.addEventListener('focus', markPrev);
+    // Capture early, before the selection mutates
+    selectEl.addEventListener('pointerdown', markPrev, true);
+    selectEl.addEventListener('mousedown', markPrev, true);
+    selectEl.addEventListener('keydown', markPrev, true);
+    selectEl.addEventListener('change', () => {
+      if (!selectEl.multiple) return;
+      const allOpt = _getAllOpt(selectEl);
+      if (!allOpt) return;
+      const prevAll = (selectEl.dataset.prevAll || '0') === '1';
+      const nowAll = !!allOpt.selected;
+
+      if (!prevAll && nowAll) {
+        // User clicked "All" -> select all reals
+        _setAllRealSelected(selectEl, true);
+      } else if (prevAll && !nowAll) {
+        // User unclicked "All" -> clear all
+        _setAllRealSelected(selectEl, false);
+      } else {
+        // User toggled individual options -> keep "All" in sync
+        _syncAllCheckbox(selectEl);
+      }
+
+      // update prev state after handling
+      markPrev();
+    });
+  }
 
   function setFilteringUI(isFiltering, msg = '') {
     const btn = document.getElementById('filterBtn');
@@ -243,10 +445,21 @@
   };
 
   function getSourceFilterValue() {
-    return (document.getElementById('filterSource') || {}).value || '';
+    const el = document.getElementById('filterSource');
+    if (!el) return '';
+    if (el.multiple) {
+      const vals = [...el.selectedOptions].map(o => (o.value || '').trim()).filter(Boolean);
+      return vals.join(','); // backend supports comma-separated multi filters
+    }
+    return (el.value || '').trim();
   }
 
   function onSourceQuickPick(sel) {
+    if (ordersPageMode === 'joined') {
+      // Source affects which mocks exist; refresh the mock dropdown first.
+      loadJoinedMockIds().finally(() => loadAll());
+      return;
+    }
     loadAll();
   }
 
@@ -275,6 +488,49 @@
       }
     } catch (e) {
       console.warn('loadSourcesForMode', e);
+    }
+  }
+
+  async function loadJoinedMockIds() {
+    if (ordersPageMode !== 'joined') return;
+    const sel = document.getElementById('joinedMockIdFilter');
+    if (!sel) return;
+    const cur = sel.multiple ? ([...sel.selectedOptions].map(o => o.value).filter(Boolean).join(',')) : (sel.value || '');
+    const src = getSourceFilterValue(); // may be comma-separated
+    try {
+      const url = src
+        ? `/api/listings_with_sales/mock_ids?source=${encodeURIComponent(src)}`
+        : '/api/listings_with_sales/mock_ids';
+      const r = await fetch(url);
+      const d = await r.json();
+      const list = (d && d.mock_ids) ? d.mock_ids : [];
+      if (!list.length) {
+        sel.innerHTML = '<option value="">No mocks for this Source</option>';
+        sel.disabled = true;
+        if (!sel.multiple) sel.value = '';
+      } else {
+        sel.disabled = false;
+        sel.innerHTML = '<option value="">All Mock IDs</option>';
+        list.forEach(v => {
+          const o = document.createElement('option');
+          o.value = v;
+          o.textContent = v;
+          sel.appendChild(o);
+        });
+        // If previously selected mock(s) aren't valid for this Source, clear them.
+        if (sel.multiple) {
+          const curSet = new Set(String(cur || '').split(',').map(s => s.trim()).filter(Boolean));
+          [...sel.options].forEach(o => { if (curSet.has(o.value)) o.selected = true; });
+        } else {
+          if ([...sel.options].some(o => o.value === cur)) sel.value = cur;
+          else sel.value = '';
+        }
+      }
+    } catch (e) {
+      // keep dropdown usable even if API fails
+      sel.disabled = false;
+      if (![...sel.options].some(o => o.value === cur)) sel.value = '';
+      console.warn('loadJoinedMockIds', e);
     }
   }
 
@@ -337,6 +593,9 @@
 
       const qtyRaw = (document.getElementById('filterQty') || {}).value || '';
       if (String(qtyRaw || '').trim()) out.push('sold', 'qty sold', 'sold_qty', 'total sold');
+
+      const mockRaw = (document.getElementById('joinedMockIdFilter') || {}).value || '';
+      if (String(mockRaw || '').trim()) out.push('mock id', 'mock_id', 'mockup');
     } else {
       const market = (document.getElementById('filterMarket') || {}).value || '';
       if (String(market || '').trim()) out.push('market', 'country');
@@ -486,13 +745,16 @@
     }
   }
 
-  async function loadOrders(page) {
+  async function loadOrders(page, append = false) {
     const rid = ++tableSeq;
     currentPage = page;
-    document.getElementById('ordersTable').innerHTML = '<div class="loading">Loading...</div>';
+    if (!append) {
+      resetInfiniteState();
+      document.getElementById('ordersTable').innerHTML = '<div class="loading">Loading...</div>';
+    }
     const searchVal = getHighlightTerms();
     try { if (ordersAbort) ordersAbort.abort(); } catch (_) {}
-    ordersAbort = new AbortController();
+    if (!append) ordersAbort = new AbortController();
     let r;
     try {
       r = await fetch(`/api/orders?page=${page}&per_page=${perPage}&${getFilterParams()}`, { signal: ordersAbort.signal });
@@ -512,9 +774,28 @@
       return;
     }
     if (rid !== tableSeq) return;
-    if (d.error) { document.getElementById('ordersTable').innerHTML = `<div class="error-msg">${d.error}</div>`; return; }
+    if (d.error) {
+      const msg = String(d.error || '');
+      // Backend may return a non-fatal "preparing cache" message on first run.
+      if (msg.toLowerCase().includes('preparing joined orders cache')) {
+        document.getElementById('ordersTable').innerHTML =
+          `<div class="info-msg">${msg}</div>`;
+        // Auto-retry once after a short delay (avoids showing a scary red banner).
+        setTimeout(() => { if (ordersPageMode === 'joined') loadListingsWithSalesFromOrders(1); }, 20000);
+        return;
+      }
+      document.getElementById('ordersTable').innerHTML = `<div class="error-msg">${msg}</div>`;
+      return;
+    }
     totalRows = d.total || 0;
-    renderTable('ordersTable', d.data, d.columns, searchVal, document.getElementById('searchInput').value, getActiveFilterColumnKeywords());
+    if (append && lastQueryKey === _getQueryKey() && lastColumns && lastColumns.length) {
+      appendRowsToExistingTable('ordersTable', d.data, lastColumns, searchVal);
+    } else {
+      lastColumns = d.columns || [];
+      renderTable('ordersTable', d.data, d.columns, searchVal, document.getElementById('searchInput').value, getActiveFilterColumnKeywords());
+      _bindInfiniteScroll();
+    }
+    loadedPages = Math.max(loadedPages, page);
     renderPagination();
   }
 
@@ -549,6 +830,7 @@
     const marketEl = document.getElementById('filterMarket');
     const qtyEl = document.getElementById('filterQty');
     const joinedSoldEl = document.getElementById('joinedSoldFilter');
+    const joinedMockEl = document.getElementById('joinedMockIdFilter');
 
     const hasSearch = !!((searchEl && searchEl.value) || '').trim();
     const hasStart = !!((startEl && startEl.value) || '').trim();
@@ -570,24 +852,35 @@
     // Joined-only highlights
     setActive(joinedListingEl, isJoined && hasJoinedListing);
     setActive(joinedSoldEl, isJoined && joinedSoldEl && !!String(joinedSoldEl.value || '').trim());
+    setActive(joinedMockEl, isJoined && joinedMockEl && !!String(joinedMockEl.value || '').trim());
 
     // Orders-only highlights
     setActive(marketEl, !isJoined && hasMarket);
   }
 
-  async function loadListingsWithSalesFromOrders(page) {
+  async function loadListingsWithSalesFromOrders(page, append = false) {
     const rid = ++tableSeq;
     currentPage = page;
-    document.getElementById('ordersTable').innerHTML = '<div class="loading">Loading...</div>';
+    if (!append) {
+      resetInfiniteState();
+      document.getElementById('ordersTable').innerHTML = '<div class="loading">Loading...</div>';
+    }
 
     const search = document.getElementById('searchInput').value;
-    const shipSource = getSourceFilterValue();
-    const listingChannel = document.getElementById('filterJoinedListing').value;
+    const shipSource = getSourceFilterValue(); // comma-separated if multi
+    const listingEl = document.getElementById('filterJoinedListing');
+    const listingChannel = listingEl && listingEl.multiple
+      ? ([...listingEl.selectedOptions].map(o => (o.value || '').trim()).filter(Boolean).join(','))
+      : ((listingEl || {}).value || '');
     updateFilterHighlights();
     const startDate = document.getElementById('startDate').value;
     const endDate = document.getElementById('endDate').value;
     const sold = getJoinedSoldParams();
     const minSoldFromQty = document.getElementById('filterQty').value;
+    const mockEl = document.getElementById('joinedMockIdFilter');
+    const mockId = mockEl && mockEl.multiple
+      ? ([...mockEl.selectedOptions].map(o => (o.value || '').trim()).filter(Boolean).join(','))
+      : ((mockEl || {}).value || '');
 
     const params = new URLSearchParams({
       page: String(page),
@@ -612,6 +905,7 @@
       params.delete('max_sold');
     }
     if (sold.max_sold) params.set('max_sold', sold.max_sold);
+    if (String(mockId || '').trim()) params.set('mock_id', String(mockId).trim());
 
     // Always include Source in keyword search (UI toggle removed)
     params.set('search_in_source', '1');
@@ -619,7 +913,7 @@
     try { if (joinedAbort) joinedAbort.abort(); } catch (_) {}
     joinedAbort = new AbortController();
     // Joined queries can be heavy; ensure we never spin forever with no UI feedback.
-    const timeoutMs = 120000; // 2 min
+    const timeoutMs = 180000; // 3 min (server uses one query; rare slow paths)
     const timeoutId = setTimeout(() => {
       try { joinedAbort.abort(); } catch (_) {}
     }, timeoutMs);
@@ -632,7 +926,7 @@
       if (rid !== tableSeq) return;
       if (e && e.name === 'AbortError') {
         document.getElementById('ordersTable').innerHTML =
-          `<div class="error-msg">Joined query timed out after ${Math.round(timeoutMs / 1000)}s. Try setting a date range and keep “1+ sold”.</div>`;
+          `<div class="error-msg">Joined query timed out after ${Math.round(timeoutMs / 1000)}s. Narrow the date range, listing channel, or source/mock filters; clear “Sold filter (≥)” only if you need zero-sold rows.</div>`;
         return;
       }
       document.getElementById('ordersTable').innerHTML =
@@ -656,14 +950,24 @@
     if (d.error) { document.getElementById('ordersTable').innerHTML = `<div class="error-msg">${d.error}</div>`; return; }
 
     totalRows = d.total || 0;
-    renderTable('ordersTable', d.data, d.columns, getHighlightTerms(), document.getElementById('searchInput').value, getActiveFilterColumnKeywords());
+    const ht = getHighlightTerms();
+    if (append && lastQueryKey === _getQueryKey() && lastColumns && lastColumns.length) {
+      appendRowsToExistingTable('ordersTable', d.data, lastColumns, ht);
+    } else {
+      lastColumns = d.columns || [];
+      renderTable('ordersTable', d.data, d.columns, ht, document.getElementById('searchInput').value, getActiveFilterColumnKeywords());
+      _bindInfiniteScroll();
+    }
+    loadedPages = Math.max(loadedPages, page);
     renderPagination();
   }
 
   function setOrdersPageMode(mode) {
     ordersPageMode = mode;
     const isJoined = mode === 'joined';
+    joinedManualRun = false;
     document.getElementById('joinedSoldFilterGroup').style.display = isJoined ? 'flex' : 'none';
+    document.getElementById('joinedMockIdFilterGroup').style.display = isJoined ? 'flex' : 'none';
     document.getElementById('joinedListingMarketGroup').style.display = isJoined ? 'flex' : 'none';
     document.getElementById('analysisView').disabled = isJoined;
     document.getElementById('filterMarket').disabled = isJoined;
@@ -690,7 +994,57 @@
     // Do not auto-default Sold Filter. User may want exact sold only (Total =),
     // or may intentionally leave Sold Filter empty.
     updateFilterHighlights();
-    loadSourcesForMode().then(() => loadAll());
+    Promise.allSettled([loadSourcesForMode(), loadJoinedMockIds()]).then(() => {
+      if (isJoined) {
+        const box = document.getElementById('ordersTable');
+        if (box) box.innerHTML = '<div class="info-msg">Select filters (optional) then click <b>Filter</b> to load Joined data.</div>';
+        setFilteringUI(false, 'Ready');
+        return;
+      }
+      loadAll();
+    });
+
+    // Joined mode supports multi-select for Source/Mock/Listing Channel.
+    const srcSel = document.getElementById('filterSource');
+    const mockSel = document.getElementById('joinedMockIdFilter');
+    const listSel = document.getElementById('filterJoinedListing');
+    if (srcSel) {
+      if (isJoined) {
+        srcSel.multiple = true;
+        srcSel.size = 1;
+        srcSel.title = 'Hold Ctrl (or Cmd) to select multiple Sources';
+        attachSelectAll(srcSel);
+      } else {
+        // collapse to single selection (keep first)
+        const first = ([...srcSel.selectedOptions][0] || {}).value || '';
+        srcSel.multiple = false;
+        srcSel.value = first;
+      }
+    }
+    if (mockSel) {
+      if (isJoined) {
+        mockSel.multiple = true;
+        mockSel.size = 1;
+        mockSel.title = 'Hold Ctrl (or Cmd) to select multiple Mock IDs';
+        attachSelectAll(mockSel);
+      } else {
+        const first = ([...mockSel.selectedOptions][0] || {}).value || '';
+        mockSel.multiple = false;
+        mockSel.value = first;
+      }
+    }
+    if (listSel) {
+      if (isJoined) {
+        listSel.multiple = true;
+        listSel.size = 1;
+        listSel.title = 'Hold Ctrl (or Cmd) to select multiple channels';
+        attachSelectAll(listSel);
+      } else {
+        const first = ([...listSel.selectedOptions][0] || {}).value || '';
+        listSel.multiple = false;
+        listSel.value = first;
+      }
+    }
   }
 
   function loadAll() {
@@ -698,6 +1052,13 @@
     setFilteringUI(true, 'Applying filters…');
     updateFilterHighlights();
     if (ordersPageMode === 'joined') {
+      // Prevent accidental heavy queries on every toggle/change.
+      if (!joinedManualRun) {
+        const box = document.getElementById('ordersTable');
+        if (box) box.innerHTML = '<div class="info-msg">Select filters (optional) then click <b>Filter</b> to load Joined data.</div>';
+        setFilteringUI(false, 'Ready');
+        return;
+      }
       loadListingsWithSalesFromOrders(1)
         .catch((e) => {
           if (e && e.name === 'AbortError') return;
@@ -709,11 +1070,25 @@
         });
       return;
     }
+    if (!ordersManualRun) {
+      const box = document.getElementById('ordersTable');
+      if (box) box.innerHTML = '<div class="info-msg">Select filters (optional) then click <b>Filter</b> to apply.</div>';
+      setFilteringUI(false, 'Ready');
+      return;
+    }
     Promise.allSettled([loadSummary(), loadOrders(1)])
       .finally(() => {
         const ms = Math.round(performance.now() - t0);
         setFilteringUI(false, `Done in ${ms}ms`);
       });
+  }
+
+  function applyFilters() {
+    // In Joined view we require explicit user intent (prevents laptop hang from auto-runs).
+    if (ordersPageMode === 'joined') joinedManualRun = true;
+    else ordersManualRun = true;
+    resetInfiniteState();
+    loadAll();
   }
 
   async function exportCSV() {
@@ -724,24 +1099,34 @@
       btn.textContent = 'Exporting...';
     }
     const isJoined = ordersPageMode === 'joined';
+    const exportAll = !!(document.getElementById('exportAllToggle') && document.getElementById('exportAllToggle').checked);
     let url = '';
     let filename = '';
     if (isJoined) {
       // Export exactly what the Joined table shows
-      const shipSource = getSourceFilterValue();
-      const listingChannel = document.getElementById('filterJoinedListing').value;
+      const shipSource = getSourceFilterValue(); // comma-separated if multi
+      const listingEl = document.getElementById('filterJoinedListing');
+      const listingChannel = listingEl && listingEl.multiple
+        ? ([...listingEl.selectedOptions].map(o => (o.value || '').trim()).filter(Boolean).join(','))
+        : ((listingEl || {}).value || '');
       const startDate = document.getElementById('startDate').value;
       const endDate = document.getElementById('endDate').value;
       const sold = getJoinedSoldParams();
       const minSoldFromQty = document.getElementById('filterQty').value;
       const search = document.getElementById('searchInput').value;
+      const mockEl = document.getElementById('joinedMockIdFilter');
+      const mockId = mockEl && mockEl.multiple
+        ? ([...mockEl.selectedOptions].map(o => (o.value || '').trim()).filter(Boolean).join(','))
+        : ((mockEl || {}).value || '');
 
       const params = new URLSearchParams({
         search: search,
         market: listingChannel,
         start_date: startDate,
         end_date: endDate,
-        search_in_source: '1'
+        search_in_source: '1',
+        all: exportAll ? '1' : '0',
+        per_page: '5000'
       });
       if (shipSource) params.set('source', shipSource);
       const qtyNum = (minSoldFromQty !== '' && !isNaN(Number(minSoldFromQty))) ? Number(minSoldFromQty) : null;
@@ -754,17 +1139,25 @@
         params.delete('max_sold');
       }
       if (sold.max_sold) params.set('max_sold', sold.max_sold);
+      if (String(mockId || '').trim()) params.set('mock_id', String(mockId).trim());
 
       url = `/api/listings_with_sales/export?${params.toString()}`;
       filename = 'Active_Listings_vs_Orders_Export.csv';
     } else {
-      url = `/api/orders/export?${getFilterParams()}`;
+      // Default export is capped; full export streams when all=1
+      url = `/api/orders/export?${getFilterParams()}&all=${exportAll ? '1' : '0'}`;
       filename = 'ShipStation_Orders_Export.csv';
     }
     if (window.pywebview && window.pywebview.api) {
       try {
-        const ok = await window.pywebview.api.download_csv(filename, 'http://127.0.0.1:5000' + url);
-        if (!ok) alert('Export failed. If you have heavy filters, try narrowing the date range or sold filter and export again.');
+        const res = await window.pywebview.api.download_csv(filename, window.location.origin + url);
+        // Backend returns: "" on success, otherwise error string.
+        if (typeof res === 'string' && res.trim()) {
+          alert(res);
+        } else if (res !== '' && res !== true && res != null) {
+          // Backward compatibility: if something unexpected is returned.
+          alert('Export failed. Please try again.');
+        }
       } catch (e) {
         console.warn('download_csv error', e);
         alert('Export failed. Please try again.');
@@ -788,20 +1181,190 @@
     }
   }
 
+  let exportAllPollTimer = null;
+  let exportAllReadyUrl = '';
+  let exportAllReadyFilename = '';
+  let exportAllToken = '';
+
+  function _setExportAllUI(state, msg, percent) {
+    const btn = document.getElementById('exportAllBtn');
+    const cancelBtn = document.getElementById('exportAllCancelBtn');
+    const st = document.getElementById('exportAllStatus');
+    const wrap = document.getElementById('exportAllBarWrap');
+    const fill = document.getElementById('exportAllBarFill');
+    if (st) { st.style.display = 'block'; st.textContent = msg || ''; }
+    if (wrap) { wrap.style.display = (state === 'progress' || state === 'preparing' || state === 'complete') ? 'block' : 'none'; }
+    if (fill && typeof percent === 'number') { fill.style.width = `${Math.max(0, Math.min(100, percent))}%`; }
+    if (btn) {
+      if (state === 'default') { btn.disabled = false; btn.textContent = '📥 Export All'; }
+      else if (state === 'preparing') { btn.disabled = true; btn.textContent = 'Preparing export...'; }
+      else if (state === 'progress') { btn.disabled = true; btn.textContent = '✍️ Writing...'; }
+      else if (state === 'complete') { btn.disabled = false; btn.textContent = '✅ Ready — click to download'; }
+      else if (state === 'error') { btn.disabled = false; btn.textContent = '❌ Export failed'; }
+    }
+    if (cancelBtn) {
+      cancelBtn.style.display = (state === 'preparing' || state === 'progress') ? 'inline-flex' : 'none';
+    }
+    if (st) {
+      st.style.color = (state === 'error') ? '#ef4444' : '#6b7280';
+    }
+  }
+
+  async function cancelExportAll() {
+    if (!exportAllToken) {
+      _setExportAllUI('default', '', 0);
+      return;
+    }
+    try {
+      await fetch(`/api/export/cancel/${encodeURIComponent(exportAllToken)}`, { method: 'POST' });
+    } catch (e) {
+      // ignore
+    }
+    if (exportAllPollTimer) { try { clearInterval(exportAllPollTimer); } catch(e) {} exportAllPollTimer = null; }
+    exportAllReadyUrl = '';
+    exportAllReadyFilename = '';
+    exportAllToken = '';
+    _setExportAllUI('default', 'Cancelled.', 0);
+  }
+
+  async function downloadPreparedExport() {
+    if (!exportAllReadyUrl) {
+      // No ready download yet; start/continue preparing.
+      return exportAllWithProgress();
+    }
+    // Prefer pywebview download API when available (more reliable for desktop).
+    if (window.pywebview && window.pywebview.api) {
+      try {
+        const filename = exportAllReadyFilename || 'export.csv';
+        const res = await window.pywebview.api.download_csv(filename, window.location.origin + exportAllReadyUrl);
+        if (typeof res === 'string' && res.trim()) alert(res);
+      } catch (e) {
+        console.warn('prepared export download_csv error', e);
+        alert('Download failed. Please try again.');
+      }
+    } else {
+      window.location.href = window.location.origin + exportAllReadyUrl;
+    }
+  }
+
+  async function exportAllWithProgress() {
+    if (exportAllPollTimer) { try { clearInterval(exportAllPollTimer); } catch(e) {} exportAllPollTimer = null; }
+    exportAllReadyUrl = '';
+    exportAllReadyFilename = '';
+    exportAllToken = '';
+
+    const isJoined = ordersPageMode === 'joined';
+    const exportType = isJoined ? 'joined' : 'orders';
+
+    // Build params exactly like exportCSV(), but for background prepare endpoint.
+    let params = new URLSearchParams();
+    if (isJoined) {
+      const shipSource = getSourceFilterValue();
+      const listingEl = document.getElementById('filterJoinedListing');
+      const listingChannel = listingEl && listingEl.multiple
+        ? ([...listingEl.selectedOptions].map(o => (o.value || '').trim()).filter(Boolean).join(','))
+        : ((listingEl || {}).value || '');
+      const startDate = document.getElementById('startDate').value;
+      const endDate = document.getElementById('endDate').value;
+      const sold = getJoinedSoldParams();
+      const minSoldFromQty = document.getElementById('filterQty').value;
+      const search = document.getElementById('searchInput').value;
+      const mockEl = document.getElementById('joinedMockIdFilter');
+      const mockId = mockEl && mockEl.multiple
+        ? ([...mockEl.selectedOptions].map(o => (o.value || '').trim()).filter(Boolean).join(','))
+        : ((mockEl || {}).value || '');
+
+      params.set('type', exportType);
+      params.set('search', search);
+      params.set('market', listingChannel);
+      params.set('start_date', startDate);
+      params.set('end_date', endDate);
+      params.set('search_in_source', '1');
+      if (shipSource) params.set('source', shipSource);
+      const qtyNum = (minSoldFromQty !== '' && !isNaN(Number(minSoldFromQty))) ? Number(minSoldFromQty) : null;
+      if (qtyNum != null) {
+        const q = Math.max(0, Math.floor(qtyNum));
+        params.set('min_sold', String(q));
+        params.set('max_sold', String(q));
+      } else if (sold.min_sold) {
+        params.set('min_sold', sold.min_sold);
+      }
+      if (sold.max_sold) params.set('max_sold', sold.max_sold);
+      if (String(mockId || '').trim()) params.set('mock_id', String(mockId).trim());
+    } else {
+      params = new URLSearchParams(getFilterParams());
+      params.set('type', exportType);
+    }
+
+    _setExportAllUI('preparing', 'Preparing export...', 2);
+    let token = '';
+    try {
+      const r = await fetch(`/api/export/prepare?${params.toString()}`, { method: 'POST' });
+      const d = await r.json();
+      if (!r.ok || !d || !d.token) throw new Error((d && d.error) ? d.error : 'Prepare failed');
+      token = d.token;
+      exportAllToken = token;
+    } catch (e) {
+      _setExportAllUI('error', `❌ Export failed: ${e && e.message ? e.message : String(e)}`, 0);
+      return;
+    }
+
+    const poll = async () => {
+      try {
+        const r = await fetch(`/api/export/status/${encodeURIComponent(token)}`);
+        const d = await r.json();
+        if (!r.ok) throw new Error((d && d.error) ? d.error : 'Status failed');
+        if (d.error) {
+          clearInterval(exportAllPollTimer);
+          exportAllPollTimer = null;
+          exportAllToken = '';
+          _setExportAllUI('error', `❌ Export failed: ${d.error}`, 0);
+          return;
+        }
+        const rows = Number(d.rows || 0);
+        const total = Number(d.total || 0);
+        const pct = total > 0 ? Math.min(100, Math.floor((rows / total) * 100)) : 0;
+        if (!d.ready) {
+          _setExportAllUI('progress', `✍️ Writing: ${fmt(rows)} / ${fmt(total)} rows (${pct}%)`, pct);
+          return;
+        }
+        // Ready
+        clearInterval(exportAllPollTimer);
+        exportAllPollTimer = null;
+        exportAllToken = token;
+        exportAllReadyUrl = d.download_url || '';
+        exportAllReadyFilename = d.filename || '';
+        _setExportAllUI('complete', `✅ ${fmt(total)} rows ready — click to download`, 100);
+      } catch (e) {
+        clearInterval(exportAllPollTimer);
+        exportAllPollTimer = null;
+        exportAllToken = '';
+        _setExportAllUI('error', `❌ Export failed: ${e && e.message ? e.message : String(e)}`, 0);
+      }
+    };
+
+    // Poll immediately + every 1500ms
+    await poll();
+    exportAllPollTimer = setInterval(poll, 1500);
+  }
+
+  // Ensure "Ready — click to download" actually downloads.
+  (() => {
+    const btn = document.getElementById('exportAllBtn');
+    if (btn) btn.onclick = downloadPreparedExport;
+  })();
+
   function goToPage(i) {
     if (ordersPageMode === 'joined') loadListingsWithSalesFromOrders(i);
     else loadOrders(i);
   }
 
   function renderPagination() {
-    const total = Math.ceil(totalRows / perPage);
-    if (total <= 1) { document.getElementById('pagination').innerHTML = ''; return; }
-    let html = '';
-    for (let i = Math.max(1, currentPage - 2); i <= Math.min(total, currentPage + 2); i++)
-      html += `<button class="page-btn ${i === currentPage ? 'active' : ''}" onclick="goToPage(${i})">${i}</button>`;
+    // Pagination buttons removed by request; table is scrollable via `.table-wrap`.
     const rowLabel = ordersPageMode === 'joined' ? 'rows' : 'orders';
-    html += `<span class="page-info">${fmt(totalRows)} total ${rowLabel}</span>`;
-    document.getElementById('pagination').innerHTML = html;
+    const loaded = Math.min(totalRows || 0, (loadedPages || 0) * perPage);
+    document.getElementById('pagination').innerHTML =
+      `<span class="page-info">${fmt(loaded)} loaded / ${fmt(totalRows)} total ${rowLabel}</span>`;
   }
 
   setOrdersPageMode('orders');

@@ -130,8 +130,9 @@ async function exportCSV(){
     const oldText = btn ? btn.textContent : '';
     if (btn) { btn.disabled = true; btn.textContent = 'Exporting...'; }
     try {
-      const ok = await window.pywebview.api.download_csv(filename, 'http://127.0.0.1:5000' + url);
-      if (!ok) alert('Export failed. Please try again.');
+      const res = await window.pywebview.api.download_csv(filename, window.location.origin + url);
+      if (typeof res === 'string' && res.trim()) alert(res);
+      else if (res !== '' && res !== true && res != null) alert('Export failed. Please try again.');
     } catch (e) {
       console.warn(e);
       alert('Export failed. Please try again.');

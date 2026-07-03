@@ -64,6 +64,27 @@ tr:hover td {
     text-align: center;
     color: #64748b;
 }
+.client-log {
+    margin-top: 12px;
+    background: #0b1220;
+    color: #e5e7eb;
+    border-radius: 10px;
+    padding: 12px 14px;
+    font-size: 12px;
+    line-height: 1.35;
+    display: none;
+    max-height: 180px;
+    overflow: auto;
+    border: 1px solid rgba(148, 163, 184, 0.25);
+}
+.client-log .row {
+    padding: 6px 0;
+    border-bottom: 1px solid rgba(148, 163, 184, 0.15);
+}
+.client-log .row:last-child { border-bottom: 0; }
+.client-log .ts { color: #93c5fd; margin-right: 8px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+.client-log .tag { color: #fbbf24; margin-right: 8px; font-weight: 700; }
+.client-log .msg { color: #e5e7eb; }
 </style>
 {% endblock %}
 
@@ -95,6 +116,7 @@ tr:hover td {
         </table>
     </div>
     <div id="loadingIndicator" class="loading">Loading Niche Structure...</div>
+    <div id="clientLog" class="client-log"></div>
 </div>
 
 <!-- Modal for Item Drilldown -->
@@ -117,11 +139,45 @@ let currentPage = 1;
 const perPage = 100;
 let searchTimer = null;
 
+function logClientError(tag, msg, extra) {
+    try {
+        const host = document.getElementById('clientLog');
+        if (!host) return;
+        const ts = new Date().toLocaleString();
+        const line = document.createElement('div');
+        line.className = 'row';
+        const safeMsg = (msg || '').toString();
+        line.innerHTML = `<span class="ts">${ts}</span><span class="tag">${(tag||'ERR').toString()}</span><span class="msg">${safeMsg.replace(/</g,'&lt;')}</span>`;
+        host.style.display = 'block';
+        host.prepend(line);
+
+        // Best-effort send to backend (doesn't block UI)
+        fetch('/api/client_log', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                page: 'niche-details',
+                tag: tag || 'ERR',
+                message: safeMsg,
+                extra: extra || null,
+                ts: new Date().toISOString()
+            })
+        }).catch(() => {});
+    } catch (_) {}
+}
+
 async function loadNiches() {
     try {
         const r = await fetch('/api/niche_management');
+        if (!r.ok) {
+            const t = await r.text().catch(() => '');
+            logClientError('API', `GET /api/niche_management failed (${r.status}) ${t ? '— ' + t : ''}`);
+            document.getElementById('loadingIndicator').innerHTML = `<div class="error-msg">Failed to load data (HTTP ${r.status})</div>`;
+            return;
+        }
         const data = await r.json();
         if (data.error) {
+            logClientError('API', `GET /api/niche_management error: ${data.error}`);
             document.getElementById('loadingIndicator').innerHTML = `<div class="error-msg">${data.error}</div>`;
             return;
         }
@@ -132,6 +188,7 @@ async function loadNiches() {
         renderTableRows(1);
 
     } catch (e) {
+        logClientError('NET', `GET /api/niche_management exception: ${e && e.message ? e.message : String(e)}`);
         document.getElementById('loadingIndicator').innerHTML = `<div class="error-msg">Failed to load data</div>`;
     }
 }
@@ -227,6 +284,7 @@ async function openItemsModal(niche, subniche) {
         const r = await fetch(`/api/niche_items?niche=${encodeURIComponent(niche)}&sub_niche=${encodeURIComponent(subniche)}`);
         if (!r.ok) {
             const t = await r.text();
+            logClientError('API', `GET /api/niche_items failed (${r.status})`, { niche, subniche, body: t });
             content.innerHTML = `<div class="error-msg">API error (${r.status}). ${t}</div>`;
             return;
         }
@@ -251,9 +309,11 @@ async function openItemsModal(niche, subniche) {
         data.forEach(item => {
             const img = (item.image || '').toString().trim();
             const esc = img.replace(/&/g, '&amp;').replace(/\"/g, '&quot;').replace(/</g, '&lt;');
+            const prox = (typeof toImageProxyUrl === 'function') ? toImageProxyUrl(img) : img;
+            const proxEsc = prox.replace(/&/g, '&amp;').replace(/\"/g, '&quot;').replace(/</g, '&lt;');
             h += `
                 <tr style="border-bottom:1px solid #f8fafc;">
-                    <td style="padding:10px;">${img ? `<img class="thumb-zoom" data-fullsrc="${esc}" src="${esc}" alt="design" loading="lazy" referrerpolicy="no-referrer" style="height:34px; width:34px; object-fit:cover; border-radius:6px; border:1px solid #e0e6ef; cursor:pointer">` : '—'}</td>
+                    <td style="padding:10px;">${img ? `<img class="thumb-zoom" data-fullsrc="${esc}" src="${proxEsc}" alt="design" loading="lazy" referrerpolicy="no-referrer" style="height:34px; width:34px; object-fit:cover; border-radius:6px; border:1px solid #e0e6ef; cursor:pointer">` : '—'}</td>
                     <td style="padding:10px; font-weight:600; color:#2196f3;">${item.sku}</td>
                     <td style="padding:10px; color:#4a6278;">${item.title}</td>
                 </tr>
@@ -264,6 +324,7 @@ async function openItemsModal(niche, subniche) {
         content.innerHTML = h;
         if (typeof bindThumbClicks === 'function') bindThumbClicks(content);
     } catch(e) {
+        logClientError('NET', `GET /api/niche_items exception: ${e && e.message ? e.message : String(e)}`, { niche, subniche });
         content.innerHTML = `<div class="error-msg">Error loading items. ${e && e.message ? e.message : ''}</div>`;
     }
 }

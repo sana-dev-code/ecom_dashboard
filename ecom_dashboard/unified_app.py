@@ -14,7 +14,9 @@ import json
 import io
 import csv
 import sys
+import socket
 import threading
+import mimetypes
 from typing import List, Dict, Any, Optional
 
 import pandas as pd
@@ -29,7 +31,30 @@ except ImportError:
     webview = None
 
 # Base directory for relative paths (Portability Fix)
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Priority:
+# 1) ECOM_DASHBOARD_ROOT (set by portable launcher) -> allows Files/ next to the .bat (zip root)
+# 2) Frozen build (PyInstaller): folder containing the .exe, OR its parent if that contains Files/
+# 3) Dev: folder containing this .py file
+_root_override = os.environ.get("ECOM_DASHBOARD_ROOT", "").strip()
+if _root_override:
+    BASE_DIR = os.path.abspath(_root_override)
+elif getattr(sys, "frozen", False):
+    _exe_dir = os.path.dirname(sys.executable)
+    _parent = os.path.dirname(_exe_dir)
+    if os.path.isdir(os.path.join(_parent, "Files")) and not os.path.isdir(os.path.join(_exe_dir, "Files")):
+        BASE_DIR = _parent
+    else:
+        BASE_DIR = _exe_dir
+else:
+    # Dev/source mode: prefer the nearest parent that contains Files/
+    _here = os.path.dirname(os.path.abspath(__file__))
+    _parent = os.path.dirname(_here)
+    if os.path.isdir(os.path.join(_here, "Files")):
+        BASE_DIR = _here
+    elif os.path.isdir(os.path.join(_parent, "Files")):
+        BASE_DIR = _parent
+    else:
+        BASE_DIR = _here
 
 EMBEDDED_TEMPLATES = {
     'base.html': '<!DOCTYPE html>\n<html lang="en">\n\n<head>\n  <meta charset="UTF-8">\n  <meta name="viewport" content="width=device-width, initial-scale=1.0">\n  <title>{% block title %}eCommerce Dashboard{% endblock %}</title>\n  <style>\n    /* ── RESET & BASE ── */\n    * {\n      box-sizing: border-box;\n      margin: 0;\n      padding: 0;\n      user-select: text;\n      -webkit-user-select: text;\n    }\n\n    body {\n      font-family: \'Segoe UI\', Arial, sans-serif;\n      background: #f0f2f7;\n      color: #1a1a2e;\n      display: flex;\n      min-height: 100vh;\n      overflow-x: hidden\n    }\n\n    /* ── SIDEBAR ── */\n    .sidebar {\n      width: 240px;\n      background: #1e2a3a;\n      color: #c8d6e5;\n      flex-shrink: 0;\n      display: flex;\n      flex-direction: column;\n      height: 100vh;\n      position: sticky;\n      top: 0;\n      z-index: 100\n    }\n\n    .sidebar-logo {\n      padding: 22px 20px 14px;\n      border-bottom: 1px solid #2d3f52\n    }\n\n    .sidebar-logo h1 {\n      font-size: 16px;\n      font-weight: 700;\n      color: #fff;\n      letter-spacing: .5px\n    }\n\n    .sidebar-logo p {\n      font-size: 11px;\n      color: #6a8aaa;\n      margin-top: 3px\n    }\n\n    .sidebar-nav {\n      flex: 1;\n      padding: 14px 0;\n      overflow-y: auto\n    }\n\n    .nav-label {\n      font-size: 10px;\n      font-weight: 700;\n      color: #4a6278;\n      text-transform: uppercase;\n      letter-spacing: 1px;\n      padding: 12px 20px 4px\n    }\n\n    .nav-link {\n      display: flex;\n      align-items: center;\n      gap: 10px;\n      padding: 10px 20px;\n      color: #a0b4c8;\n      text-decoration: none;\n      font-size: 13.5px;\n      transition: all .15s;\n      border-left: 3px solid transparent\n    }\n\n    .nav-link:hover {\n      background: #263545;\n      color: #fff;\n      border-left-color: #4a9eff\n    }\n\n    .nav-link.active {\n      background: #263545;\n      color: #4a9eff;\n      border-left-color: #4a9eff;\n      font-weight: 600\n    }\n\n    .nav-link .icon {\n      font-size: 16px;\n      width: 20px;\n      text-align: center\n    }\n\n    .sidebar-footer {\n      padding: 14px 20px;\n      border-top: 1px solid #2d3f52;\n      font-size: 11px;\n      color: #4a6278\n    }\n\n    /* ── MAIN ── */\n    .main {\n      flex: 1;\n      display: flex;\n      flex-direction: column;\n      min-height: 100vh;\n      min-width: 0\n    }\n\n    .topbar {\n      background: #fff;\n      padding: 14px 28px;\n      border-bottom: 1px solid #e2e8f0;\n      display: flex;\n      align-items: center;\n      justify-content: center;\n      position: sticky;\n      top: 0;\n      z-index: 50;\n      width: 100%\n    }\n\n    .topbar-inner {\n      width: 100%;\n      max-width: 1400px;\n      display: flex;\n      align-items: center;\n      justify-content: space-between\n    }\n\n    .topbar h2 {\n      font-size: 18px;\n      font-weight: 700;\n      color: #1e2a3a\n    }\n\n    .topbar .subtitle {\n      font-size: 12px;\n      color: #8a9ab0;\n      margin-top: 2px\n    }\n\n    .content {\n      padding: 24px 28px;\n      flex: 1;\n      width: 100%;\n      max-width: 1400px;\n      margin: 0 auto\n    }\n\n    /* ── CARDS ── */\n    .stat-grid {\n      display: grid;\n      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));\n      gap: 20px;\n      margin-bottom: 24px\n    }\n\n    .stat-card {\n      background: #fff;\n      border-radius: 12px;\n      padding: 20px;\n      box-shadow: 0 1px 3px rgba(0, 0, 0, .08);\n      transition: transform .2s, box-shadow .2s\n    }\n\n    .stat-card:hover {\n      transform: translateY(-2px);\n      box-shadow: 0 4px 6px rgba(0, 0, 0, .05)\n    }\n\n    .stat-card .label {\n      font-size: 11px;\n      color: #8a9ab0;\n      font-weight: 600;\n      text-transform: uppercase;\n      letter-spacing: .5px;\n      margin-bottom: 8px\n    }\n\n    .stat-card .value {\n      font-size: 26px;\n      font-weight: 700;\n      color: #1e2a3a\n    }\n\n    .stat-card .sub {\n      font-size: 11px;\n      color: #b0bec5;\n      margin-top: 6px\n    }\n\n    .stat-card.accent .value {\n      color: #2196f3\n    }\n\n    .stat-card.green .value {\n      color: #1D9E75\n    }\n\n    .stat-card.orange .value {\n      color: #f5a623\n    }\n\n    /* ── TABLES ── */\n    .table-card {\n      background: #fff;\n      border-radius: 12px;\n      box-shadow: 0 1px 3px rgba(0, 0, 0, .08);\n      overflow: hidden;\n      margin-bottom: 24px\n    }\n\n    .table-header {\n      padding: 18px 24px;\n      display: flex;\n      align-items: center;\n      justify-content: space-between;\n      border-bottom: 1px solid #f0f2f7\n    }\n\n    .table-header h3 {\n      font-size: 15px;\n      font-weight: 700;\n      color: #1e2a3a\n    }\n\n    .table-wrap {\n      overflow-x: auto\n    }\n\n    table {\n      width: 100%;\n      border-collapse: collapse;\n      font-size: 13.5px\n    }\n\n    th {\n      background: #f8fafc;\n      color: #6a8aaa;\n      font-weight: 700;\n      font-size: 11px;\n      text-transform: uppercase;\n      letter-spacing: .8px;\n      padding: 12px 18px;\n      text-align: left;\n      white-space: nowrap;\n      border-bottom: 1px solid #e9eef5\n    }\n\n    td {\n      padding: 12px 24px;\n      color: #4a6278;\n      border-bottom: 1px solid #f8fafc;\n      user-select: text;\n      -webkit-user-select: text;\n      white-space: nowrap;\n      max-width: 250px;\n      overflow: hidden;\n      text-overflow: ellipsis\n    }\n\n    tr:hover td {\n      background: #f8fafc\n    }\n\n    tr:last-child td {\n      border-bottom: none\n    }\n\n    /* ── SEARCH ── */\n    .search-bar {\n      display: flex;\n      gap: 12px;\n      margin-bottom: 20px\n    }\n\n    .search-bar input {\n      flex: 1;\n      padding: 10px 16px;\n      border: 1px solid #dde3ed;\n      border-radius: 10px;\n      font-size: 13.5px;\n      outline: none;\n      transition: .2s\n    }\n\n    .search-bar input:focus {\n      border-color: #4a9eff;\n      box-shadow: 0 0 0 3px rgba(74, 158, 255, .15)\n    }\n\n    .btn {\n      padding: 10px 22px;\n      background: #1e2a3a;\n      color: #fff;\n      border: none;\n      border-radius: 10px;\n      font-size: 13px;\n      cursor: pointer;\n      transition: .2s;\n      font-weight: 600\n    }\n\n    .btn:hover {\n      background: #2c3e53;\n      transform: translateY(-1px)\n    }\n\n    .btn-outline {\n      background: transparent;\n      border: 1px solid #dde3ed;\n      color: #344055\n    }\n\n    .btn-outline:hover {\n      background: #f8fafc\n    }\n\n    /* ── PAGINATION ── */\n    .pagination {\n      display: flex;\n      align-items: center;\n      gap: 10px;\n      padding: 16px 24px;\n      border-top: 1px solid #f0f4f8\n    }\n\n    .page-btn {\n      padding: 8px 16px;\n      border: 1px solid #dde3ed;\n      border-radius: 8px;\n      background: #fff;\n      cursor: pointer;\n      font-size: 13px;\n      color: #344055;\n      transition: .2s\n    }\n\n    .page-btn:hover {\n      background: #f0f4f8;\n      border-color: #ccd5e0\n    }\n\n    .page-btn.active {\n      background: #1e2a3a;\n      color: #fff;\n      border-color: #1e2a3a\n    }\n\n    .page-info {\n      font-size: 12.5px;\n      color: #8a9ab0;\n      margin-left: auto\n    }\n\n    /* ── BADGES ── */\n    .badge {\n      display: inline-block;\n      padding: 3px 10px;\n      border-radius: 14px;\n      font-size: 11px;\n      font-weight: 700\n    }\n\n    .badge-blue {\n      background: #e3f0ff;\n      color: #1565c0\n    }\n\n    .badge-green {\n      background: #e8f5e9;\n      color: #2e7d32\n    }\n\n    .badge-orange {\n      background: #fff3e0;\n      color: #e65100\n    }\n\n    .badge-red {\n      background: #ffebee;\n      color: #c62828\n    }\n\n    /* ── LOADING ── */\n    .loading {\n      text-align: center;\n      padding: 50px;\n      color: #8a9ab0;\n      font-size: 14px;\n      font-weight: 500\n    }\n\n    .error-msg {\n      background: #fff3f3;\n      border: 1px solid #ffcdd2;\n      color: #c62828;\n      border-radius: 10px;\n      padding: 16px 20px;\n      font-size: 13.5px;\n      margin-bottom: 20px\n    }\n\n    /* ── CHART AREA ── */\n    .chart-grid {\n      display: grid;\n      grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));\n      gap: 20px;\n      margin-bottom: 24px\n    }\n    .chart-card {\n      background: #fff;\n      border-radius: 12px;\n      box-shadow: 0 1px 3px rgba(0, 0, 0, .08);\n      padding: 20px\n    }\n    .chart-card h3 {\n      font-size: 14px;\n      font-weight: 700;\n      color: #1e2a3a;\n      margin-bottom: 18px\n    }\n    .chart-wrap {\n      position: relative;\n      width: 100%;\n      height: 260px\n    }\n\n    /* ── FILTER BOX ── */\n    .filter-box {\n      background: #fff;\n      border-radius: 12px;\n      padding: 18px 22px;\n      box-shadow: 0 1px 3px rgba(0, 0, 0, .05);\n      margin-bottom: 20px;\n      display: grid;\n      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));\n      gap: 16px;\n      align-items: end;\n      border: 1px solid #eef2f6;\n    }\n\n    .filter-group {\n      display: flex;\n      flex-direction: column;\n      gap: 6px;\n    }\n\n    .filter-group label {\n      font-size: 10px;\n      font-weight: 700;\n      color: #8a9ab0;\n      text-transform: uppercase;\n      letter-spacing: .5px;\n    }\n\n    .filter-group input, .filter-group select {\n      padding: 9px 12px;\n      border: 1px solid #dde3ed;\n      border-radius: 8px;\n      font-size: 13px;\n      outline: none;\n      transition: all .2s;\n      background: #fbfcfd;\n    }\n\n    .filter-group input:focus {\n      border-color: #4a9eff;\n      background: #fff;\n      box-shadow: 0 0 0 3px rgba(74, 158, 255, .1);\n    }\n\n    .btn-success {\n      background: #1D9E75;\n      color: #fff;\n    }\n\n    .btn-success:hover {\n      background: #188663;\n      transform: translateY(-1px);\n      box-shadow: 0 4px 10px rgba(29, 158, 117, .2);\n    }\n\n    /* ── DB STATUS DOTS ── */\n    .db-dot {\n      width: 10px;\n      height: 10px;\n      border-radius: 50%;\n      display: inline-block;\n      margin-right: 8px\n    }\n\n    .db-dot.ok {\n      background: #1D9E75;\n      box-shadow: 0 0 5px rgba(29, 158, 117, .4)\n    }\n\n    .db-dot.missing {\n      background: #e53935;\n      box-shadow: 0 0 5px rgba(229, 57, 53, .4)\n    }\n\n    /* ── HIGHLIGHT ── */\n    mark.highlight {\n      background: #fff3cd;\n      color: #856404;\n      padding: 0 2px;\n      border-radius: 2px;\n      border-bottom: 2px solid #ffeeba;\n      font-weight: 600;\n    }\n  </style>\n  {% block extra_style %}{% endblock %}\n</head>\n\n<body>\n\n  <!-- SIDEBAR -->\n  <aside class="sidebar">\n    <div class="sidebar-logo">\n      <h1>📦 eCommerce Ops</h1>\n      <p>Operations Dashboard</p>\n    </div>\n    <nav class="sidebar-nav">\n      <div class="nav-label">Overview</div>\n      <a href="/" class="nav-link {% if request.path == \'/\' %}active{% endif %}">\n        <span class="icon">🏠</span> Home\n      </a>\n\n      <div class="nav-label">Catalogue</div>\n      <a href="/products" class="nav-link {% if request.path == \'/products\' %}active{% endif %}">\n        <span class="icon">🛍️</span> Products\n      </a>\n      <a href="/listings" class="nav-link {% if request.path == \'/listings\' %}active{% endif %}">\n        <span class="icon">📋</span> Active Listings\n      </a>\n      <a href="/niche-details" class="nav-link {% if request.path == \'/niche-details\' %}active{% endif %}">\n        <span class="icon">📁</span> Niche Management\n      </a>\n      <a href="/trends" class="nav-link {% if request.path == \'/trends\' %}active{% endif %}">\n        <span class="icon">📈</span> Trends\n      </a>\n\n      <div class="nav-label">Orders</div>\n      <a href="/orders" class="nav-link {% if request.path == \'/orders\' %}active{% endif %}">\n        <span class="icon">🚚</span> ShipStation Orders\n      </a>\n\n      <div class="nav-label">Tools</div>\n      <a href="/explorer" class="nav-link {% if request.path == \'/explorer\' %}active{% endif %}">\n        <span class="icon">🗄️</span> DB Explorer\n      </a>\n    </nav>\n    <div class="sidebar-footer">v1.0 · DuckDB Backend</div>\n  </aside>\n\n  <!-- MAIN -->\n  <div class="main">\n    <div class="topbar">\n      <div class="topbar-inner">\n        <div>\n          <h2>{% block page_title %}Dashboard{% endblock %}</h2>\n          <div class="subtitle">{% block page_subtitle %}{% endblock %}</div>\n        </div>\n        <div style="display:flex; align-items:center; gap:15px;">\n          <button onclick="window.location.reload()" class="btn btn-sm btn-outline" style="min-width: unset; padding: 6px 12px;">\n            🔄 Refresh\n          </button>\n          <div style="font-size:12px;color:#8a9ab0">\n            📅 <span id="current-date"></span>\n          </div>\n        </div>\n      </div>\n    </div>\n    <div class="content">\n      {% block content %}{% endblock %}\n    </div>\n  </div>\n\n  <script>\n    document.getElementById(\'current-date\').textContent = new Date().toLocaleDateString(\'en-GB\', { weekday: \'short\', day: \'numeric\', month: \'short\', year: \'numeric\' });\n\n    // Global helpers\n    function fmt(n) { return Number(n).toLocaleString() }\n    function truncate(s, n = 40) { return s && s.length > n ? s.slice(0, n) + \'…\' : s || \'—\' }\n\n    function showError(id, msg) {\n      const el = document.getElementById(id);\n      if (el) el.innerHTML = `<div class="error-msg">⚠️ ${msg}</div>`;\n    }\n\n    function applyHighlights(text, highlightTerm) {\n      let out = String(text ?? \'\');\n      const raw = String(highlightTerm || \'\').trim();\n      if (!raw) return out;\n\n      // Support multi-term highlighting (text, numbers, dates, etc.)\n      // Example: "dog 2026 03/26" highlights all tokens independently.\n      const tokens = Array.from(\n        new Set(\n          raw\n            .split(/\\s+/)\n            .map(t => t.trim())\n            .filter(Boolean)\n        )\n      ).sort((a, b) => b.length - a.length); // longer token first\n\n      for (const token of tokens) {\n        if (token.length < 1) continue;\n        const esc = token.replace(/[.*+?^${}()|[\\]\\\\]/g, \'\\\\$&\');\n        out = out.replace(new RegExp(`(${esc})`, \'gi\'), \'<mark class="highlight">$1</mark>\');\n      }\n      return out;\n    }\n\n    function hasHighlightMatch(text, highlightTerm) {\n      const raw = String(highlightTerm || \'\').trim();\n      if (!raw) return false;\n      const s = String(text ?? \'\');\n      const tokens = raw.split(/\\s+/).map(t => t.trim()).filter(Boolean);\n      return tokens.some(t => s.toLowerCase().includes(t.toLowerCase()));\n    }\n\n    function ensureImageModal() {\n      let m = document.getElementById(\'imgModal\');\n      if (m) return m;\n      m = document.createElement(\'div\');\n      m.id = \'imgModal\';\n      m.style.cssText = \'display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:9999; align-items:center; justify-content:center; padding:20px;\';\n      m.onclick = (event) => { if (event.target && event.target.id === \'imgModal\') closeImageModal(); };\n      m.innerHTML = `\n        <div style="background:#fff; border-radius:12px; max-width:92vw; max-height:92vh; padding:14px; box-shadow:0 12px 40px rgba(0,0,0,.25);">\n          <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:10px;">\n            <a id="imgModalLink" href="#" target="_blank" rel="noopener" style="font-size:12px; color:#1a73e8; text-decoration:none;">Open original</a>\n            <button class="btn btn-sm btn-outline" onclick="closeImageModal()">Close</button>\n          </div>\n          <img id="imgModalImg" src="" alt="Full size" style="max-width:85vw; max-height:80vh; display:block; border-radius:10px; border:1px solid #eef2f6;">\n        </div>\n      `;\n      document.body.appendChild(m);\n      return m;\n    }\n\n    function openImageModal(url) {\n      const m = ensureImageModal();\n      const im = document.getElementById(\'imgModalImg\');\n      const a = document.getElementById(\'imgModalLink\');\n      if (!m || !im || !a) return;\n      im.src = url;\n      a.href = url;\n      m.style.display = \'flex\';\n    }\n\n    /** Delegate clicks for thumbnails using data-fullsrc (no fragile inline onclick escaping). */\n    function bindThumbClicks(root) {\n      if (!root) return;\n      if (root.dataset.thumbBound === \'1\') return;\n      root.dataset.thumbBound = \'1\';\n      root.addEventListener(\'click\', (ev) => {\n        const img = ev.target && ev.target.closest ? ev.target.closest(\'img.thumb-zoom\') : null;\n        if (!img) return;\n        const u = img.getAttribute(\'data-fullsrc\');\n        if (u) openImageModal(u);\n      });\n    }\n\n    function closeImageModal() {\n      const m = document.getElementById(\'imgModal\');\n      const im = document.getElementById(\'imgModalImg\');\n      if (!m || !im) return;\n      im.src = \'\';\n      m.style.display = \'none\';\n    }\n\n    function renderTable(containerId, data, columns, highlightTerm = "") {\n      const container = document.getElementById(containerId);\n      if (!container) return;\n      if (!data || !data.length) {\n        container.innerHTML = \'<div class="loading">No results for current filters.</div>\';\n        return;\n      }\n      \n      const cols = columns || Object.keys(data[0]);\n      let html = `<div class="table-wrap"><table><thead><tr>`;\n      cols.forEach(c => html += `<th title="${c}">${c}</th>`);\n      html += `</tr></thead><tbody>`;\n      \n      data.forEach(row => {\n        html += `<tr>`;\n        cols.forEach(c => {\n          let rawVal = row[c];\n          let val = String(rawVal || \'—\');\n\n          if (String(c).toLowerCase() === \'image\') {\n            const url = String(rawVal || \'\').trim();\n            if (url) {\n              const esc = url.replace(/&/g, \'&amp;\').replace(/\\"/g, \'&quot;\').replace(/</g, \'&lt;\');\n              html += `<td title="Click to view"><img class="thumb-zoom" data-fullsrc="${esc}" src="${esc}" alt="design" loading="lazy" referrerpolicy="no-referrer" style="height:34px; width:34px; object-fit:cover; border-radius:6px; border:1px solid #e0e6ef; cursor:pointer"></td>`;\n              return;\n            }\n            html += `<td title="—">—</td>`;\n            return;\n          }\n\n          const matched = hasHighlightMatch(val, highlightTerm);\n          // If the cell matches search, show a longer piece so highlight is visible.\n          let displayVal = matched ? truncate(val, 120) : truncate(val);\n          if (displayVal !== \'—\') displayVal = applyHighlights(displayVal, highlightTerm);\n          \n          html += `<td title="${val}">${displayVal}</td>`;\n        });\n        html += `</tr>`;\n      });\n      html += `</tbody></table></div>`;\n      delete container.dataset.thumbBound;\n      container.innerHTML = html;\n      bindThumbClicks(container);\n    }\n  </script>\n  {% block scripts %}{% endblock %}\n</body>\n\n</html>',
@@ -57,11 +82,47 @@ def get_resource_path(relative_path):
     meipass = getattr(sys, '_MEIPASS', None)
     if meipass:
         return os.path.join(meipass, relative_path)
-    return os.path.join(os.path.abspath("."), relative_path)
+    return os.path.join(BASE_DIR, relative_path)
 
 app = Flask(__name__, 
             template_folder=get_resource_path("templates"),
             static_folder=get_resource_path("static"))
+
+# ─── CLIENT-SIDE ERROR LOG (UI → backend) ─────────────────────────────────────
+# Keeps lightweight recent logs for debugging page-load failures (e.g. Niche Mgmt).
+_client_log_lock = threading.Lock()
+_client_logs: List[Dict[str, Any]] = []
+
+
+@app.route("/api/client_log", methods=["POST"])
+def api_client_log():
+    try:
+        payload = request.get_json(silent=True) or {}
+        rec = {
+            "ts": payload.get("ts"),
+            "page": payload.get("page", ""),
+            "tag": payload.get("tag", ""),
+            "message": payload.get("message", ""),
+            "extra": payload.get("extra", None),
+            "ip": request.remote_addr,
+        }
+        with _client_log_lock:
+            _client_logs.append(rec)
+            if len(_client_logs) > 200:
+                del _client_logs[:-200]
+        try:
+            print(f"[CLIENT_LOG] {rec.get('page')} {rec.get('tag')}: {rec.get('message')}", file=sys.stderr)
+        except Exception:
+            pass
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/client_log", methods=["GET"])
+def api_client_log_list():
+    with _client_log_lock:
+        return jsonify({"logs": list(_client_logs)})
 
 # Use embedded templates when running as a single-file bundle
 try:
@@ -211,6 +272,42 @@ def _load_design_images_index() -> Dict[str, str]:
     _DESIGN_IMAGES_CACHE["signature"] = sig
     _DESIGN_IMAGES_CACHE["map"] = out
     return out
+
+def _map_images_for_sku_series(sku_series: "pd.Series", img_map: Dict[str, str]) -> "pd.Series":
+    s0 = sku_series.astype(str).fillna("").str.strip().str.rstrip(".").str.lower()
+    base = s0.str.split("-", n=1).str[0]
+    digits = base.str.extract(r"^(\d+)", expand=False).fillna("")
+    out = base.map(img_map)
+    out = out.fillna((base + "lg").map(img_map))
+    out = out.fillna(digits.map(img_map))
+    out = out.fillna((digits + "lg").map(img_map))
+    return out.fillna("")
+
+@app.route("/api/debug/image_lookup")
+def api_debug_image_lookup():
+    sku = (request.args.get("sku", "") or "").strip()
+    if not sku:
+        return jsonify({"error": "missing sku"}), 400
+    try:
+        img_map = _load_design_images_index()
+        s0 = str(sku).strip().rstrip(".").lower()
+        base = s0.split("-", 1)[0]
+        import re
+        m = re.match(r"^(\d+)", base)
+        digits = m.group(1) if m else ""
+        candidates = [base, base + "lg", digits, digits + "lg"]
+        tried = []
+        found = ""
+        for k in candidates:
+            if not k:
+                continue
+            v = img_map.get(k, "")
+            tried.append({"key": k, "hit": bool(v)})
+            if v and not found:
+                found = v
+        return jsonify({"sku": sku, "candidates": candidates, "tried": tried, "found_url": found, "map_size": len(img_map or {})})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # ─── JOINED (LISTINGS + ORDERS) STRUCTURE CACHE ────────────────────────────────
 _JOINED_STRUCT_CACHE: dict[str, Any] = {
@@ -901,6 +998,52 @@ def niche_details():
 
 @app.route("/api/niche_management")
 def api_niche_management():
+    # Unified mode: read directly from unified_db.unified_data (reliable across dist/zip)
+    if os.path.exists(UNIFIED_DB):
+        conn_u = None
+        try:
+            conn_u = duckdb.connect(UNIFIED_DB, read_only=True)
+            cols = [str(c[0]) for c in conn_u.execute('DESCRIBE "unified_data"').fetchall()]
+
+            c_sku = next((c for c in ["Design ID", "design_id", "Product Code", "Product-Code", "SKU", "sku"] if c in cols), None)
+            c_niche = next((c for c in ["Niche", "niche", "Department", "Product Category", "category"] if c in cols), None)
+            c_sub = next((c for c in ["Sub Niche", "Sub-Niche", "sub_niche", "SubNiche", "Sub-Department"] if c in cols), None)
+
+            if not c_sku or not c_niche:
+                return jsonify({"error": "Unified DB: required columns missing for Niche Management"})
+
+            # Some unified DBs have different/non-standard source_type values.
+            # Filtering by source_type can accidentally hide all rows, so keep this unfiltered.
+            where_src = ""
+
+            niche_expr = f'REGEXP_REPLACE(TRIM(CAST("{c_niche}" AS VARCHAR)), \'^"+|"+$\', \'\')'
+            sub_expr = (
+                f'REGEXP_REPLACE(TRIM(CAST("{c_sub}" AS VARCHAR)), \'^"+|"+$\', \'\')'
+                if c_sub
+                else "''"
+            )
+            data = conn_u.execute(f"""
+                SELECT
+                    {niche_expr} AS Niche,
+                    {sub_expr} AS SubNiche,
+                    COUNT(DISTINCT TRIM(CAST("{c_sku}" AS VARCHAR))) AS DesignsCount
+                FROM unified_data
+                WHERE "{c_niche}" IS NOT NULL AND {niche_expr} != ''
+                {where_src}
+                GROUP BY 1, 2
+                ORDER BY Niche ASC, SubNiche ASC
+            """).fetchdf().to_dict(orient="records")
+
+            return jsonify(data)
+        except Exception as e:
+            return jsonify({"error": str(e)})
+        finally:
+            try:
+                if conn_u is not None:
+                    conn_u.close()
+            except Exception:
+                pass
+
     # Attempt to connect to catalogue OR products DB to get Niche/SubNiche metrics
     conn_p = None
     db_key = None
@@ -974,6 +1117,96 @@ def api_niche_management():
 def api_niche_items():
     niche = request.args.get("niche", "").strip()
     sub_niche = request.args.get("sub_niche", "").strip()
+
+    def _normalize_image_url(u: str) -> str:
+        s = (u or "").strip().strip('"').strip("'")
+        if not s:
+            return ""
+        if s.lower().startswith("www."):
+            s = "https://" + s
+        if "drive.google.com" in s:
+            try:
+                import re
+                m = re.search(r"/file/d/([^/]+)", s)
+                if m:
+                    s = f"https://drive.google.com/uc?export=view&id={m.group(1)}"
+            except Exception:
+                pass
+        return s
+
+    # Unified mode: pull items from unified_data (portable and consistent)
+    if os.path.exists(UNIFIED_DB):
+        conn_u = None
+        try:
+            conn_u = duckdb.connect(UNIFIED_DB, read_only=True)
+            cols = [str(c[0]) for c in conn_u.execute('DESCRIBE "unified_data"').fetchall()]
+
+            c_sku = next((c for c in ["Design ID", "design_id", "Product Code", "Product-Code", "SKU", "sku"] if c in cols), None)
+            c_niche = next((c for c in ["Niche", "niche", "Department", "Product Category", "category"] if c in cols), None)
+            c_sub = next((c for c in ["Sub Niche", "Sub-Niche", "sub_niche", "SubNiche", "Sub-Department"] if c in cols), None)
+            c_title = next((c for c in ["eBay Title", "Amazon Title", "ETSY Title", "Website Title", "Title", "title", "Product Name", "Name"] if c in cols), None)
+            c_img = next((c for c in ["Item - Image URL", "IMAGE1", "Image", "image"] if c in cols), None)
+
+            if not c_sku or not c_niche or not c_sub:
+                return jsonify({"error": "Unified DB: required columns missing for Niche Items"})
+
+            niche_expr = f'REGEXP_REPLACE(TRIM(CAST("{c_niche}" AS VARCHAR)), \'^"+|"+$\', \'\')'
+            sub_expr = f'REGEXP_REPLACE(TRIM(CAST("{c_sub}" AS VARCHAR)), \'^"+|"+$\', \'\')'
+            data = conn_u.execute(f"""
+                SELECT
+                    TRIM(CAST("{c_sku}" AS VARCHAR)) AS sku,
+                    TRIM(CAST("{c_title}" AS VARCHAR)) AS title,
+                    TRIM(CAST("{c_img}" AS VARCHAR)) AS image
+                FROM unified_data
+                WHERE {niche_expr} = ?
+                  AND {sub_expr} = ?
+                LIMIT 200
+            """, [niche, sub_niche]).fetchdf().fillna("").to_dict(orient="records")
+
+            img_map = {}
+            try:
+                img_map = _load_design_images_index()
+            except Exception:
+                img_map = {}
+
+            out = []
+            for r in data:
+                sku_raw = (r.get("sku") or "").strip()
+                img_raw = _normalize_image_url((r.get("image") or "").strip())
+                if not img_raw and img_map and sku_raw:
+                    s0 = sku_raw.strip().rstrip(".").lower()
+                    candidates = [s0, s0.split("-", 1)[0]]
+                    try:
+                        import re
+                        m = re.match(r"^(\d+)", s0)
+                        if m:
+                            candidates.append(m.group(1))
+                    except Exception:
+                        pass
+                    for k in candidates:
+                        if not k:
+                            continue
+                        v = img_map.get(k)
+                        if v:
+                            img_raw = _normalize_image_url(v)
+                            if img_raw:
+                                break
+                out.append(
+                    {
+                        "sku": sku_raw,
+                        "title": (r.get("title") or "").strip() or "—",
+                        "image": img_raw,
+                    }
+                )
+            return jsonify(out)
+        except Exception as e:
+            return jsonify({"error": str(e)})
+        finally:
+            try:
+                if conn_u is not None:
+                    conn_u.close()
+            except Exception:
+                pass
     
     conn_p = None
     if os.path.exists(CATALOGUE_DB):
@@ -1031,6 +1264,42 @@ def api_niche_items():
         return jsonify([])
     finally:
         if conn_p: conn_p.close()
+
+@app.route("/api/image_proxy")
+def api_image_proxy():
+    url = (request.args.get("url", "") or "").strip()
+    if not url:
+        return Response("Missing url", status=400, mimetype="text/plain")
+    if url.lower().startswith("www."):
+        url = "https://" + url
+    if not (url.lower().startswith("http://") or url.lower().startswith("https://")):
+        return Response("Only http/https urls are allowed", status=400, mimetype="text/plain")
+
+    try:
+        r = requests.get(
+            url,
+            stream=True,
+            timeout=(10, 30),
+            headers={
+                "User-Agent": "Mozilla/5.0 (ecom-dashboard image proxy)",
+                "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            },
+            allow_redirects=True,
+        )
+        if r.status_code != 200:
+            return Response(f"Upstream HTTP {r.status_code}", status=502, mimetype="text/plain")
+
+        ct = (r.headers.get("content-type") or "").split(";")[0].strip().lower()
+        if not ct:
+            guess, _ = mimetypes.guess_type(url)
+            ct = guess or "application/octet-stream"
+
+        data = r.content
+        resp = Response(data, status=200, mimetype=ct)
+        resp.headers["Cache-Control"] = "public, max-age=86400"
+        return resp
+    except Exception as e:
+        return Response(f"Proxy error: {e}", status=502, mimetype="text/plain")
 
 @app.route("/products")
 def products():
@@ -1317,11 +1586,8 @@ def api_orders():
             if img_map:
                 c_sku_any = next((c for c in ["Item - SKU", "Item - Fill SKU", "asin", "ASIN", "sku", "seller-sku"] if c in cols), None)
                 if c_sku_any and c_sku_any in data_df.columns:
-                    sku_series = data_df[c_sku_any].astype(str)
-                    base_series = (
-                        sku_series.str.strip().str.rstrip(".").str.lower().str.split("-", n=1).str[0]
-                    )
-                    data_df.insert(0, "Image", base_series.map(img_map).fillna(""))
+                    mapped = _map_images_for_sku_series(data_df[c_sku_any], img_map)
+                    data_df.insert(0, "Image", mapped)
         except Exception as e:
             print(f"[orders design_images] mapping error: {e}")
 
@@ -1989,6 +2255,7 @@ def api_listings_with_sales():
     start_date = request.args.get("start_date", "").strip()
     end_date = request.args.get("end_date", "").strip()
     f_listing_source = request.args.get("source", "").strip()
+    mock_id = request.args.get("mock_id", "").strip()
 
     # Note: Joined view allows empty dates and empty sold filters (user choice).
 
@@ -2215,6 +2482,23 @@ def api_listings_with_sales():
 
         cat_cte_sql = ""
         if cat_table:
+            # Optional Mock ID support (column may not exist in some catalogue schemas)
+            cat_mock_col = None
+            try:
+                if not cat_src_col or not cat_sub_col:
+                    # best-effort: reuse previously described cols if present
+                    pass
+            except Exception:
+                pass
+            try:
+                _cc = [str(c[0]) for c in conn_c.execute(f'DESCRIBE "{cat_table}"').fetchall()]
+                for candidate in ["Mockup Identifier", "mockup_identifier", "Mock ID", "mock_id", "Mockup ID", "mockup_id"]:
+                    if candidate in _cc:
+                        cat_mock_col = candidate
+                        break
+            except Exception:
+                cat_mock_col = None
+
             cat_src_sql = (
                 f'TRIM(CAST("{cat_src_col}" AS VARCHAR)) AS cat_source'
                 if cat_src_col
@@ -2225,6 +2509,11 @@ def api_listings_with_sales():
                 if cat_sub_col
                 else "'' AS cat_sub_source"
             )
+            cat_mock_sql = (
+                f'COALESCE(NULLIF(TRIM(CAST("{cat_mock_col}" AS VARCHAR)), \'\'), \'\') AS mock_id'
+                if cat_mock_col
+                else "'' AS mock_id"
+            )
             cat_cte_sql = f"""
             , cat AS (
                 SELECT
@@ -2234,6 +2523,7 @@ def api_listings_with_sales():
                     TRIM(CAST("Product Category" AS VARCHAR)) AS product_category,
                     TRIM(CAST("Product Sub-Category" AS VARCHAR)) AS product_sub_category,
                     TRIM(CAST("Product Code" AS VARCHAR)) AS product_code,
+                    {cat_mock_sql},
                     {cat_src_sql},
                     {cat_sub_sql},
                     TRIM(CAST("eBay Title" AS VARCHAR)) AS ebay_title,
@@ -2248,6 +2538,12 @@ def api_listings_with_sales():
             """
 
         source_display = f'{src_coalesce_sql} AS "Source"'
+
+        mock_filter_sql = ""
+        mock_filter_params: List[Any] = []
+        if mock_id and cat_table:
+            mock_filter_sql = " AND LOWER(COALESCE(c.mock_id,'')) LIKE ?"
+            mock_filter_params.append(f"%{mock_id.lower()}%")
 
         base_query = f"""
             WITH listings AS (
@@ -2294,10 +2590,11 @@ def api_listings_with_sales():
             WHERE 1=1
             {sold_filter_sql}
             {listing_source_filter_sql}
+            {mock_filter_sql}
             {search_sql}
         """
 
-        params = listing_params + order_params + listing_source_filter_params + search_params
+        params = listing_params + order_params + listing_source_filter_params + mock_filter_params + search_params
 
         # IMPORTANT: Avoid COUNT(*) OVER() here.
         # Window-count forces DuckDB to materialize the entire joined result (and often sort it)
@@ -2321,9 +2618,8 @@ def api_listings_with_sales():
         try:
             img_map = _load_design_images_index()
             if img_map and "SKU" in data_df.columns:
-                sku_series = data_df["SKU"].astype(str)
-                base_series = sku_series.str.strip().str.rstrip(".").str.lower().str.split("-", n=1).str[0]
-                data_df.insert(0, "Image", base_series.map(img_map).fillna(""))
+                mapped = _map_images_for_sku_series(data_df["SKU"], img_map)
+                data_df.insert(0, "Image", mapped)
         except Exception as e:
             print(f"[design_images] mapping error: {e}")
 
@@ -2369,6 +2665,45 @@ def api_listings_with_sales():
             conn_c.close()
 
 
+@app.route("/api/listings_with_sales/mock_ids")
+def api_joined_mock_ids():
+    """Distinct Mock IDs for Joined view dropdown."""
+    # Unified app: prefer unified_data, otherwise fallback to catalogue table (if any)
+    conn_l = get_connection("active_listings")
+    if not conn_l or not os.path.exists(UNIFIED_DB):
+        return jsonify({"mock_ids": []})
+
+    try:
+        cols = [str(c[0]) for c in conn_l.execute('DESCRIBE "unified_data"').fetchall()]
+        mock_col = None
+        for candidate in ["Mockup Identifier", "mockup_identifier", "Mock ID", "mock_id", "Mockup ID", "mockup_id"]:
+            if candidate in cols:
+                mock_col = candidate
+                break
+        if not mock_col:
+            return jsonify({"mock_ids": []})
+
+        df = conn_l.execute(
+            f"""
+            SELECT DISTINCT TRIM(CAST("{mock_col}" AS VARCHAR)) AS v
+            FROM unified_data
+            WHERE "{mock_col}" IS NOT NULL
+              AND TRIM(CAST("{mock_col}" AS VARCHAR)) != ''
+            ORDER BY 1
+            LIMIT 5000
+            """
+        ).fetchdf()
+        out = [str(x).strip() for x in (df["v"].tolist() if "v" in df.columns else []) if str(x).strip()]
+        return jsonify({"mock_ids": out})
+    except Exception as e:
+        return jsonify({"mock_ids": [], "error": str(e)})
+    finally:
+        try:
+            conn_l.close()
+        except Exception:
+            pass
+
+
 @app.route("/api/listings_with_sales/export")
 def api_listings_with_sales_export():
     """
@@ -2385,6 +2720,7 @@ def api_listings_with_sales_export():
     start_date = request.args.get("start_date", "").strip()
     end_date = request.args.get("end_date", "").strip()
     f_listing_source = request.args.get("source", "").strip()
+    mock_id = request.args.get("mock_id", "").strip()
 
     # Same safety default as the paged endpoint: avoid exporting an unbounded "all listings including 0-sold"
     # join unless the user explicitly narrows it down.
@@ -2543,11 +2879,26 @@ def api_listings_with_sales_export():
 
         cat_cte_sql = ""
         if cat_table:
+            cat_mock_col = None
+            try:
+                _cc = [str(c[0]) for c in conn_c.execute(f'DESCRIBE "{cat_table}"').fetchall()]
+                for candidate in ["Mockup Identifier", "mockup_identifier", "Mock ID", "mock_id", "Mockup ID", "mockup_id"]:
+                    if candidate in _cc:
+                        cat_mock_col = candidate
+                        break
+            except Exception:
+                cat_mock_col = None
+
             cat_src_sql = (
                 f'TRIM(CAST("{cat_src_col}" AS VARCHAR)) AS cat_source' if cat_src_col else "'' AS cat_source"
             )
             cat_sub_sql = (
                 f'TRIM(CAST("{cat_sub_col}" AS VARCHAR)) AS cat_sub_source' if cat_sub_col else "'' AS cat_sub_source"
+            )
+            cat_mock_sql = (
+                f'COALESCE(NULLIF(TRIM(CAST("{cat_mock_col}" AS VARCHAR)), \'\'), \'\') AS mock_id'
+                if cat_mock_col
+                else "'' AS mock_id"
             )
             cat_cte_sql = f"""
             , cat AS (
@@ -2556,6 +2907,7 @@ def api_listings_with_sales_export():
                     TRIM(CAST("Niche" AS VARCHAR)) AS niche,
                     TRIM(CAST("Sub Niche" AS VARCHAR)) AS sub_niche,
                     TRIM(CAST("Product Code" AS VARCHAR)) AS product_code,
+                    {cat_mock_sql},
                     {cat_src_sql},
                     {cat_sub_sql},
                     TRIM(CAST("eBay Title" AS VARCHAR)) AS ebay_title,
@@ -2617,6 +2969,12 @@ def api_listings_with_sales_export():
             """
                 search_params.extend([like_search, like_search, like_search])
 
+        mock_filter_sql = ""
+        mock_filter_params: List[Any] = []
+        if mock_id and cat_table:
+            mock_filter_sql = " AND LOWER(COALESCE(c.mock_id,'')) LIKE ?"
+            mock_filter_params.append(f"%{mock_id.lower()}%")
+
         base_query = f"""
             WITH listings AS (
                 {listings_union}
@@ -2661,20 +3019,20 @@ def api_listings_with_sales_export():
             WHERE 1=1
             {sold_filter_sql}
             {listing_source_filter_sql}
+            {mock_filter_sql}
             {search_sql}
             ORDER BY "Sold Qty" ASC, Title ASC
         """
 
-        params = listing_params + order_params + listing_source_filter_params + search_params
+        params = listing_params + order_params + listing_source_filter_params + mock_filter_params + search_params
         df = conn_l.execute(base_query + " LIMIT 20000", params).fetchdf()
 
         # Add Image column (same as UI)
         try:
             img_map = _load_design_images_index()
             if img_map and "SKU" in df.columns:
-                sku_series = df["SKU"].astype(str)
-                base_series = sku_series.str.strip().str.rstrip(".").str.lower().str.split("-", n=1).str[0]
-                df.insert(0, "Image", base_series.map(img_map).fillna(""))
+                mapped = _map_images_for_sku_series(df["SKU"], img_map)
+                df.insert(0, "Image", mapped)
         except Exception as e:
             print(f"[design_images export] mapping error: {e}")
 
@@ -3242,10 +3600,26 @@ class AppApi:
         return False
 
 if __name__ == "__main__":
+    def _pick_port(preferred: int = 5000) -> int:
+        """Pick a free localhost port, preferring `preferred` if available."""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind(("127.0.0.1", preferred))
+            s.close()
+            return preferred
+        except Exception:
+            pass
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        port = int(s.getsockname()[1])
+        s.close()
+        return port
+
     if "--desktop" in sys.argv:
         if webview:
+            port = _pick_port(5000)
             def run_flask():
-                app.run(port=5000, debug=False, use_reloader=False, threaded=True)
+                app.run(port=port, debug=False, use_reloader=False, threaded=True)
             
             t = threading.Thread(target=run_flask)
             t.daemon = True
@@ -3255,7 +3629,7 @@ if __name__ == "__main__":
             api = AppApi()
             webview.create_window(
                 "eCommerce Operations Dashboard", 
-                "http://localhost:5000", 
+                f"http://127.0.0.1:{port}", 
                 js_api=api,
                 width=1280, height=840,
                 text_select=True,
@@ -3264,11 +3638,13 @@ if __name__ == "__main__":
             webview.start()
         else:
             print("webview not found, running in standard mode...")
-            app.run(debug=True, port=5000)
+            port = _pick_port(5000)
+            app.run(debug=True, port=port)
     else:
+        port = _pick_port(5000)
         print("\n" + "="*55)
         print("  eCommerce Dashboard Starting...")
         print("="*55)
-        print(f"  Url: http://localhost:5000")
+        print(f"  Url: http://127.0.0.1:{port}")
         print("="*55 + "\n")
-        app.run(debug=True, port=5000)
+        app.run(debug=True, port=port)
